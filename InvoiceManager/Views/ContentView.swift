@@ -7,25 +7,27 @@ struct ContentView: View {
 
     @State private var showAdd = false
     @State private var searchText = ""
-    @State private var selectedInvoice: Invoice?
+    @State private var showExport = false
+    @State private var exportURL: URL?
 
     private var filtered: [Invoice] {
-        if searchText.isEmpty { return invoices }
+        guard !searchText.isEmpty else { return invoices }
         let q = searchText.lowercased()
         return invoices.filter {
-            $0.vendor.lowercased().contains(q) ||
-            $0.notes.lowercased().contains(q) ||
-            $0.category.lowercased().contains(q)
+            $0.vendor.lowercased().contains(q)
+                || $0.notes.lowercased().contains(q)
+                || $0.category.lowercased().contains(q)
+                || String(format: "%.2f", $0.amount).contains(q)
         }
     }
 
-    private var grouped: [(key: String, title: String, items: [Invoice], total: Double)] {
-        let dict = Dictionary(grouping: filtered) { $0.monthKey }
-        return dict.keys.sorted(by: >).map { key in
-            let items = dict[key]!.sorted { $0.date > $1.date }
-            let total = items.reduce(0) { $0 + $1.amount }
-            let title = items.first?.monthTitle ?? key
-            return (key, title, items, total)
+    private var groups: [(key: String, title: String, items: [Invoice], total: Double)] {
+        let dict = Dictionary(grouping: filtered, by: \.monthKey)
+        return dict.keys.sorted(by: >).compactMap { key in
+            guard let items = dict[key] else { return nil }
+            let sorted = items.sorted { $0.date > $1.date }
+            let total = sorted.reduce(0.0) { $0 + $1.amount }
+            return (key, sorted.first?.monthTitle ?? key, sorted, total)
         }
     }
 
@@ -35,152 +37,164 @@ struct ContentView: View {
 
     var body: some View {
         NavigationStack {
-            ZStack {
-                LinearGradient(
-                    colors: [
-                        Color(red: 0.12, green: 0.14, blue: 0.22),
-                        Color(red: 0.08, green: 0.09, blue: 0.14)
-                    ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-                .ignoresSafeArea()
-
+            Group {
                 if invoices.isEmpty {
-                    emptyState
+                    ContentUnavailableView {
+                        Label("还没有发票", systemImage: "doc.text")
+                    } description: {
+                        Text("点右上角 + 添加。支持手动填写、拍照，或一次导入多张电子发票 PDF。")
+                    } actions: {
+                        Button("添加发票") { showAdd = true }
+                            .buttonStyle(.borderedProminent)
+                    }
                 } else {
-                    ScrollView {
-                        VStack(spacing: 16) {
-                            summaryCard
-                            ForEach(grouped, id: \.key) { group in
-                                monthSection(group)
+                    List {
+                        Section {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("合计")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(String(format: "¥%.2f", grandTotal))
+                                    .font(.system(size: 28, weight: .bold, design: .rounded))
+                                Text("\(filtered.count) / \(invoices.count) 张")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.vertical, 4)
+                        }
+
+                        ForEach(groups, id: \.key) { group in
+                            Section {
+                                ForEach(group.items, id: \.id) { inv in
+                                    NavigationLink {
+                                        InvoiceDetailView(invoice: inv)
+                                    } label: {
+                                        InvoiceRow(invoice: inv)
+                                    }
+                                    .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                        Button(role: .destructive) {
+                                            modelContext.delete(inv)
+                                            try? modelContext.save()
+                                        } label: {
+                                            Label("删除", systemImage: "trash")
+                                        }
+                                    }
+                                }
+                            } header: {
+                                HStack {
+                                    Text(group.title)
+                                    Spacer()
+                                    Text(String(format: "¥%.2f", group.total))
+                                }
                             }
                         }
-                        .padding(.horizontal, 16)
-                        .padding(.bottom, 100)
                     }
+                    .listStyle(.insetGrouped)
                 }
             }
             .navigationTitle("发票")
-            .navigationBarTitleDisplayMode(.large)
-            .toolbarBackground(.ultraThinMaterial, for: .navigationBar)
-            .searchable(text: $searchText, prompt: "搜索商家、分类、备注")
+            .searchable(text: $searchText, prompt: "搜索商家、金额、备注")
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    if !invoices.isEmpty {
+                        Menu {
+                            Button {
+                                exportCSV()
+                            } label: {
+                                Label("导出 CSV 表格", systemImage: "tablecells")
+                            }
+                            Button {
+                                exportAttachments()
+                            } label: {
+                                Label("导出全部附件", systemImage: "doc.on.doc")
+                            }
+                        } label: {
+                            Image(systemName: "square.and.arrow.up")
+                        }
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button { showAdd = true } label: {
+                    Button {
+                        showAdd = true
+                    } label: {
                         Image(systemName: "plus")
-                            .font(.body.weight(.semibold))
-                            .frame(width: 32, height: 32)
-                            .background(.ultraThinMaterial, in: Circle())
                     }
                 }
             }
             .sheet(isPresented: $showAdd) {
                 AddInvoiceView()
             }
-            .sheet(item: $selectedInvoice) { inv in
-                InvoiceDetailView(invoice: inv)
-            }
-        }
-        .preferredColorScheme(.dark)
-    }
-
-    private var summaryCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("当前筛选合计")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-            Text(String(format: "¥%.2f", grandTotal))
-                .font(.system(size: 34, weight: .bold, design: .rounded))
-            Text("\(filtered.count) 张发票")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(20)
-        .background {
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .fill(.ultraThinMaterial)
-                .overlay {
-                    RoundedRectangle(cornerRadius: 20, style: .continuous)
-                        .strokeBorder(
-                            LinearGradient(
-                                colors: [.white.opacity(0.25), .white.opacity(0.05)],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            ),
-                            lineWidth: 1
-                        )
-                }
-        }
-        .padding(.top, 8)
-    }
-
-    private func monthSection(_ group: (key: String, title: String, items: [Invoice], total: Double)) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text(group.title).font(.headline)
-                Spacer()
-                Text(String(format: "¥%.2f", group.total))
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, 4)
-
-            VStack(spacing: 0) {
-                ForEach(Array(group.items.enumerated()), id: \.element.id) { index, inv in
-                    InvoiceRow(invoice: inv)
-                        .contentShape(Rectangle())
-                        .onTapGesture { selectedInvoice = inv }
-                        .contextMenu {
-                            Button(role: .destructive) {
-                                withAnimation {
-                                    modelContext.delete(inv)
-                                    try? modelContext.save()
-                                }
-                            } label: {
-                                Label("删除", systemImage: "trash")
-                            }
-                        }
-
-                    if index < group.items.count - 1 {
-                        Divider().padding(.leading, 64)
-                    }
+            .sheet(isPresented: $showExport) {
+                if let exportURL {
+                    ShareSheet(items: [exportURL])
                 }
             }
-            .background {
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .fill(.ultraThinMaterial)
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 16, style: .continuous)
-                            .strokeBorder(.white.opacity(0.12), lineWidth: 1)
-                    }
-            }
         }
     }
 
-    private var emptyState: some View {
-        VStack(spacing: 20) {
-            Image(systemName: "doc.text.magnifyingglass")
-                .font(.system(size: 56))
-                .foregroundStyle(.secondary)
-            Text("还没有发票")
-                .font(.title2.weight(.semibold))
-            Text("点右上角 + ，支持手动填写、拍照、相册，或从文件一次导入多张电子发票 PDF")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 40)
+    // MARK: - 导出 CSV
 
-            Button { showAdd = true } label: {
-                Label("添加发票", systemImage: "plus")
-                    .font(.body.weight(.semibold))
-                    .padding(.horizontal, 24)
-                    .padding(.vertical, 12)
-                    .background(.ultraThinMaterial, in: Capsule())
-            }
-            .padding(.top, 8)
+    private func exportCSV() {
+        var lines = ["日期,商家,分类,金额,备注,来源"]
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd"
+        for inv in invoices.sorted(by: { $0.date > $1.date }) {
+            let row = [
+                df.string(from: inv.date),
+                csvEscape(inv.vendor),
+                csvEscape(inv.category),
+                String(format: "%.2f", inv.amount),
+                csvEscape(inv.notes),
+                inv.source
+            ].joined(separator: ",")
+            lines.append(row)
         }
+        let csv = lines.joined(separator: "\n")
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("发票导出-\(Int(Date().timeIntervalSince1970)).csv")
+        do {
+            try csv.data(using: .utf8)?.write(to: url)
+            exportURL = url
+            showExport = true
+        } catch {
+            print("CSV export failed: \(error)")
+        }
+    }
+
+    private func csvEscape(_ s: String) -> String {
+        if s.contains(",") || s.contains("\"") || s.contains("\n") {
+            return "\"" + s.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+        }
+        return s
+    }
+
+    // MARK: - 导出附件（打包到临时目录后分享）
+
+    private func exportAttachments() {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("发票附件-\(Int(Date().timeIntervalSince1970))", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        var count = 0
+        for inv in invoices {
+            guard let data = inv.imageData else { continue }
+            let name: String
+            if let fn = inv.fileName, !fn.isEmpty {
+                name = fn
+            } else if data.count > 4 && data[0] == 0x25 && data[1] == 0x50 { // %PDF
+                name = "\(inv.vendor.isEmpty ? "发票" : inv.vendor)-\(String(format: "%.2f", inv.amount)).pdf"
+            } else {
+                name = "\(inv.vendor.isEmpty ? "发票" : inv.vendor)-\(String(format: "%.2f", inv.amount)).jpg"
+            }
+            let safe = name.replacingOccurrences(of: "/", with: "-")
+            let fileURL = dir.appendingPathComponent(safe)
+            try? data.write(to: fileURL)
+            count += 1
+        }
+
+        guard count > 0 else { return }
+        exportURL = dir
+        showExport = true
     }
 }
 
@@ -188,50 +202,56 @@ struct InvoiceRow: View {
     let invoice: Invoice
 
     var body: some View {
-        HStack(spacing: 14) {
-            thumbnail
+        HStack(spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color(.tertiarySystemFill))
+                    .frame(width: 44, height: 44)
+                if let data = invoice.imageData, let ui = UIImage(data: data) {
+                    Image(uiImage: ui)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 44, height: 44)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                } else {
+                    Image(systemName: invoice.imageData != nil ? "doc.richtext" : "doc.text")
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             VStack(alignment: .leading, spacing: 4) {
                 Text(invoice.vendor.isEmpty ? "未填商家" : invoice.vendor)
                     .font(.body.weight(.medium))
                     .lineLimit(1)
                 HStack(spacing: 6) {
                     Text(invoice.category)
-                        .font(.caption2.weight(.medium))
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 3)
-                        .background(Color.accentColor.opacity(0.25), in: Capsule())
-                    Text(invoice.date, format: .dateTime.month().day())
+                        .font(.caption2)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.accentColor.opacity(0.15), in: Capsule())
+                    Text(invoice.date, format: .dateTime.year().month().day())
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
             }
-            Spacer(minLength: 8)
+
+            Spacer()
+
             Text(String(format: "¥%.2f", invoice.amount))
                 .font(.body.weight(.semibold).monospacedDigit())
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
+        .padding(.vertical, 2)
+    }
+}
+
+struct ShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
     }
 
-    @ViewBuilder
-    private var thumbnail: some View {
-        if let data = invoice.imageData, let ui = UIImage(data: data) {
-            Image(uiImage: ui)
-                .resizable()
-                .scaledToFill()
-                .frame(width: 44, height: 44)
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        } else {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color.white.opacity(0.08))
-                .frame(width: 44, height: 44)
-                .overlay {
-                    Image(systemName: invoice.source == "file" ? "doc.richtext" : "doc.text")
-                        .font(.system(size: 18))
-                        .foregroundStyle(.secondary)
-                }
-        }
-    }
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
 #Preview {

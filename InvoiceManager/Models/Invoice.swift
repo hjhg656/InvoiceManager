@@ -3,15 +3,17 @@ import SwiftData
 
 @Model
 final class Invoice {
-    var id: UUID
+    @Attribute(.unique) var id: UUID
     var amount: Double
     var date: Date
     var vendor: String
     var category: String
     var notes: String
-    @Attribute(.externalStorage) var imageData: Data?
+    /// 发票附件（图片或 PDF 原始数据）
+    var imageData: Data?
+    var fileName: String?
     var createdAt: Date
-    var source: String   // manual / photo / file / email
+    var source: String
 
     init(
         amount: Double = 0,
@@ -20,6 +22,7 @@ final class Invoice {
         category: String = "其他",
         notes: String = "",
         imageData: Data? = nil,
+        fileName: String? = nil,
         source: String = "manual"
     ) {
         self.id = UUID()
@@ -29,12 +32,14 @@ final class Invoice {
         self.category = category
         self.notes = notes
         self.imageData = imageData
+        self.fileName = fileName
         self.createdAt = Date()
         self.source = source
     }
 
     var monthKey: String {
         let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
         f.dateFormat = "yyyy-MM"
         return f.string(from: date)
     }

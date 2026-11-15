@@ -1,144 +1,74 @@
 import SwiftUI
+import SwiftData
 
 struct InvoiceDetailView: View {
     @Bindable var invoice: Invoice
-    @Environment(\.dismiss) private var dismiss
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.dismiss) private var dismiss
+    @State private var showShare = false
+    @State private var shareURL: URL?
 
     var body: some View {
-        NavigationStack {
-            ZStack {
-                Color(red: 0.10, green: 0.11, blue: 0.16)
-                    .ignoresSafeArea()
-
-                ScrollView {
-                    VStack(spacing: 20) {
-                        // 预览区
-                        if let data = invoice.imageData, let ui = UIImage(data: data) {
-                            Image(uiImage: ui)
-                                .resizable()
-                                .scaledToFit()
-                                .frame(maxHeight: 280)
-                                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                                .overlay {
-                                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                        .strokeBorder(.white.opacity(0.15), lineWidth: 1)
-                                }
-                                .padding(.horizontal)
-                        } else if invoice.imageData != nil {
-                            // PDF 等
-                            VStack(spacing: 12) {
-                                Image(systemName: "doc.richtext.fill")
-                                    .font(.system(size: 48))
-                                    .foregroundStyle(.secondary)
-                                Text("PDF 文件已保存")
-                                    .font(.subheadline)
-                                    .foregroundStyle(.secondary)
-                            }
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 40)
-                            .background {
-                                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                    .fill(.ultraThinMaterial)
-                            }
-                            .padding(.horizontal)
-                        }
-
-                        // 金额大字
-                        VStack(spacing: 4) {
-                            Text("金额")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Text(String(format: "¥%.2f", invoice.amount))
-                                .font(.system(size: 36, weight: .bold, design: .rounded))
-                        }
+        List {
+            if let data = invoice.imageData, let ui = UIImage(data: data) {
+                Section {
+                    Image(uiImage: ui)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxHeight: 280)
                         .frame(maxWidth: .infinity)
-                        .padding(.vertical, 16)
-                        .background {
-                            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                .fill(.ultraThinMaterial)
-                                .overlay {
-                                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                        .strokeBorder(.white.opacity(0.12), lineWidth: 1)
-                                }
-                        }
-                        .padding(.horizontal)
+                        .listRowInsets(EdgeInsets())
+                }
+            } else if invoice.imageData != nil {
+                Section {
+                    Label(invoice.fileName ?? "PDF 附件", systemImage: "doc.richtext.fill")
+                        .foregroundStyle(.secondary)
+                }
+            }
 
-                        // 信息卡片
-                        VStack(spacing: 0) {
-                            detailRow("商家", invoice.vendor.isEmpty ? "—" : invoice.vendor)
-                            Divider().padding(.leading, 16)
-                            detailRow("分类", invoice.category)
-                            Divider().padding(.leading, 16)
-                            detailRow("日期", invoice.date.formatted(date: .long, time: .omitted))
-                            Divider().padding(.leading, 16)
-                            detailRow("来源", sourceLabel)
-                        }
-                        .background {
-                            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                .fill(.ultraThinMaterial)
-                                .overlay {
-                                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                        .strokeBorder(.white.opacity(0.12), lineWidth: 1)
-                                }
-                        }
-                        .padding(.horizontal)
+            Section("金额") {
+                Text(String(format: "¥%.2f", invoice.amount))
+                    .font(.largeTitle.weight(.bold))
+            }
 
-                        if !invoice.notes.isEmpty {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("备注")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                Text(invoice.notes)
-                                    .font(.body)
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(16)
-                            .background {
-                                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                    .fill(.ultraThinMaterial)
-                            }
-                            .padding(.horizontal)
-                        }
+            Section("信息") {
+                LabeledContent("商家", value: invoice.vendor.isEmpty ? "—" : invoice.vendor)
+                LabeledContent("分类", value: invoice.category)
+                LabeledContent("日期") {
+                    Text(invoice.date, format: .dateTime.year().month().day())
+                }
+                LabeledContent("来源", value: sourceLabel)
+            }
 
-                        Button(role: .destructive) {
-                            modelContext.delete(invoice)
-                            dismiss()
-                        } label: {
-                            Text("删除发票")
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 14)
-                                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                        }
-                        .padding(.horizontal)
-                        .padding(.top, 8)
+            if !invoice.notes.isEmpty {
+                Section("备注") {
+                    Text(invoice.notes)
+                }
+            }
+
+            Section {
+                if invoice.imageData != nil {
+                    Button {
+                        shareAttachment()
+                    } label: {
+                        Label("导出此发票附件", systemImage: "square.and.arrow.up")
                     }
-                    .padding(.vertical, 16)
                 }
-            }
-            .navigationTitle("详情")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbarBackground(.ultraThinMaterial, for: .navigationBar)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("完成") { dismiss() }
-                        .fontWeight(.semibold)
-                }
-            }
-        }
-        .preferredColorScheme(.dark)
-    }
 
-    private func detailRow(_ title: String, _ value: String) -> some View {
-        HStack {
-            Text(title)
-                .foregroundStyle(.secondary)
-            Spacer()
-            Text(value)
-                .fontWeight(.medium)
+                Button("删除", role: .destructive) {
+                    modelContext.delete(invoice)
+                    try? modelContext.save()
+                    dismiss()
+                }
+            }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 14)
+        .navigationTitle("详情")
+        .navigationBarTitleDisplayMode(.inline)
+        .sheet(isPresented: $showShare) {
+            if let shareURL {
+                ShareSheet(items: [shareURL])
+            }
+        }
     }
 
     private var sourceLabel: String {
@@ -148,5 +78,21 @@ struct InvoiceDetailView: View {
         case "email": return "邮件"
         default: return "手动录入"
         }
+    }
+
+    private func shareAttachment() {
+        guard let data = invoice.imageData else { return }
+        let name = invoice.fileName
+            ?? (isPDF(data)
+                ? "\(invoice.vendor)-\(String(format: "%.2f", invoice.amount)).pdf"
+                : "\(invoice.vendor)-\(String(format: "%.2f", invoice.amount)).jpg")
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        try? data.write(to: url)
+        shareURL = url
+        showShare = true
+    }
+
+    private func isPDF(_ data: Data) -> Bool {
+        data.count > 4 && data[0] == 0x25 && data[1] == 0x50 && data[2] == 0x44 && data[3] == 0x46
     }
 }
