@@ -16,6 +16,7 @@ struct AddInvoiceView: View {
     @State private var showCamera = false
     @State private var showFileImporter = false
     @State private var importSource = "manual"
+    @State private var importError: String?
 
     private let categories = ["餐饮", "交通", "住宿", "办公", "通讯", "购物", "医疗", "其他"]
 
@@ -46,48 +47,63 @@ struct AddInvoiceView: View {
                     }
                     .listRowBackground(glassRow)
 
-                    Section("发票文件 / 图片") {
+                    Section {
+                        // 预览
                         if let imageData, let ui = UIImage(data: imageData) {
                             Image(uiImage: ui)
                                 .resizable()
                                 .scaledToFit()
                                 .frame(maxHeight: 200)
+                                .frame(maxWidth: .infinity)
                                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                                 .listRowInsets(EdgeInsets(top: 12, leading: 12, bottom: 12, trailing: 12))
+                                .listRowBackground(glassRow)
                         } else if imageData != nil {
-                            // PDF 或其他非图片：显示占位
                             HStack {
-                                Image(systemName: "doc.richtext.fill")
-                                    .font(.title)
-                                    .foregroundStyle(.secondary)
-                                Text("已选择文件（PDF）")
-                                    .foregroundStyle(.secondary)
-                            }
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 20)
-                        }
-
-                        HStack(spacing: 12) {
-                            importButton(title: "相册", icon: "photo.on.rectangle") {
-                                // PhotosPicker 用下面的隐藏控件
-                            }
-                            .overlay {
-                                PhotosPicker(selection: $selectedPhoto, matching: .images) {
-                                    Color.clear
+                                Spacer()
+                                VStack(spacing: 8) {
+                                    Image(systemName: "doc.richtext.fill")
+                                        .font(.system(size: 40))
+                                        .foregroundStyle(.secondary)
+                                    Text("已选择 PDF 文件")
+                                        .font(.subheadline)
+                                        .foregroundStyle(.secondary)
                                 }
+                                .padding(.vertical, 24)
+                                Spacer()
                             }
-
-                            importButton(title: "拍照", icon: "camera") {
-                                showCamera = true
-                            }
-
-                            importButton(title: "文件", icon: "folder") {
-                                showFileImporter = true
-                            }
+                            .listRowBackground(glassRow)
                         }
-                        .listRowInsets(EdgeInsets(top: 12, leading: 16, bottom: 12, trailing: 16))
+
+                        // 三个导入入口 —— 不用嵌套 Button+overlay，直接拆开
+                        PhotosPicker(selection: $selectedPhoto, matching: .images) {
+                            importLabel(title: "从相册选择", icon: "photo.on.rectangle")
+                        }
+                        .listRowBackground(glassRow)
+
+                        Button {
+                            showCamera = true
+                        } label: {
+                            importLabel(title: "拍照", icon: "camera")
+                        }
+                        .listRowBackground(glassRow)
+
+                        Button {
+                            showFileImporter = true
+                        } label: {
+                            importLabel(title: "从文件导入（PDF / 图片）", icon: "folder")
+                        }
+                        .listRowBackground(glassRow)
+
+                        if let importError {
+                            Text(importError)
+                                .font(.footnote)
+                                .foregroundStyle(.red)
+                                .listRowBackground(Color.clear)
+                        }
+                    } header: {
+                        Text("发票文件 / 图片")
                     }
-                    .listRowBackground(glassRow)
 
                     Section("备注") {
                         TextField("可选备注", text: $notes, axis: .vertical)
@@ -96,7 +112,7 @@ struct AddInvoiceView: View {
                     .listRowBackground(glassRow)
 
                     Section {
-                        Text("支持从「文件」App 导入 PDF 或图片。邮箱附件可先存到文件再导入。")
+                        Text("邮件里的发票：先把附件存到「文件」App，再点上面「从文件导入」。")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
@@ -119,9 +135,15 @@ struct AddInvoiceView: View {
             }
             .onChange(of: selectedPhoto) { _, newItem in
                 Task {
-                    if let data = try? await newItem?.loadTransferable(type: Data.self) {
-                        imageData = data
-                        importSource = "photo"
+                    guard let newItem else { return }
+                    do {
+                        if let data = try await newItem.loadTransferable(type: Data.self) {
+                            imageData = data
+                            importSource = "photo"
+                            importError = nil
+                        }
+                    } catch {
+                        importError = "读取相册图片失败：\(error.localizedDescription)"
                     }
                 }
             }
@@ -129,12 +151,15 @@ struct AddInvoiceView: View {
                 CameraPicker(imageData: $imageData)
                     .ignoresSafeArea()
                     .onDisappear {
-                        if imageData != nil { importSource = "photo" }
+                        if imageData != nil {
+                            importSource = "photo"
+                            importError = nil
+                        }
                     }
             }
             .fileImporter(
                 isPresented: $showFileImporter,
-                allowedContentTypes: [.pdf, .image, .jpeg, .png, .heic],
+                allowedContentTypes: [.pdf, .image, .jpeg, .png, .heic, UTType(filenameExtension: "jpg")].compactMap { $0 },
                 allowsMultipleSelection: false
             ) { result in
                 handleFileImport(result)
@@ -144,44 +169,51 @@ struct AddInvoiceView: View {
     }
 
     private var glassRow: some View {
-        RoundedRectangle(cornerRadius: 0)
-            .fill(.ultraThinMaterial)
+        Color.white.opacity(0.06)
     }
 
-    private func importButton(title: String, icon: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            VStack(spacing: 6) {
-                Image(systemName: icon)
-                    .font(.title3)
-                Text(title)
-                    .font(.caption)
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 14)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .strokeBorder(.white.opacity(0.15), lineWidth: 1)
-            }
+    private func importLabel(title: String, icon: String) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .font(.body)
+                .frame(width: 28)
+                .foregroundStyle(Color.accentColor)
+            Text(title)
+                .foregroundStyle(.primary)
+            Spacer()
+            Image(systemName: "chevron.right")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.tertiary)
         }
-        .buttonStyle(.plain)
+        .contentShape(Rectangle())
     }
 
     private func handleFileImport(_ result: Result<[URL], Error>) {
-        guard case .success(let urls) = result, let url = urls.first else { return }
-        let accessed = url.startAccessingSecurityScopedResource()
-        defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+        switch result {
+        case .failure(let error):
+            importError = "选择文件失败：\(error.localizedDescription)"
+        case .success(let urls):
+            guard let url = urls.first else {
+                importError = "未选择文件"
+                return
+            }
+            let accessed = url.startAccessingSecurityScopedResource()
+            defer {
+                if accessed { url.stopAccessingSecurityScopedResource() }
+            }
 
-        guard let data = try? Data(contentsOf: url) else { return }
-
-        // 如果是图片，直接当预览；PDF 也存进去，列表用文档图标
-        imageData = data
-        importSource = "file"
-
-        // 尝试从文件名猜商家
-        if vendor.isEmpty {
-            let name = url.deletingPathExtension().lastPathComponent
-            if !name.isEmpty { vendor = name }
+            do {
+                let data = try Data(contentsOf: url)
+                imageData = data
+                importSource = "file"
+                importError = nil
+                if vendor.isEmpty {
+                    let name = url.deletingPathExtension().lastPathComponent
+                    if !name.isEmpty { vendor = name }
+                }
+            } catch {
+                importError = "读取文件失败：\(error.localizedDescription)"
+            }
         }
     }
 
@@ -207,7 +239,7 @@ struct CameraPicker: UIViewControllerRepresentable {
 
     func makeUIViewController(context: Context) -> UIImagePickerController {
         let p = UIImagePickerController()
-        p.sourceType = .camera
+        p.sourceType = UIImagePickerController.isSourceTypeAvailable(.camera) ? .camera : .photoLibrary
         p.delegate = context.coordinator
         return p
     }
