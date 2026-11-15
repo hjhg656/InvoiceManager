@@ -36,7 +36,6 @@ struct ContentView: View {
     var body: some View {
         NavigationStack {
             ZStack {
-                // 背景渐变 + 玻璃氛围
                 LinearGradient(
                     colors: [
                         Color(red: 0.12, green: 0.14, blue: 0.22),
@@ -53,7 +52,6 @@ struct ContentView: View {
                     ScrollView {
                         VStack(spacing: 16) {
                             summaryCard
-
                             ForEach(grouped, id: \.key) { group in
                                 monthSection(group)
                             }
@@ -69,9 +67,7 @@ struct ContentView: View {
             .searchable(text: $searchText, prompt: "搜索商家、分类、备注")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        showAdd = true
-                    } label: {
+                    Button { showAdd = true } label: {
                         Image(systemName: "plus")
                             .font(.body.weight(.semibold))
                             .frame(width: 32, height: 32)
@@ -81,19 +77,13 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showAdd) {
                 AddInvoiceView()
-                    .presentationDetents([.large])
-                    .presentationDragIndicator(.visible)
             }
             .sheet(item: $selectedInvoice) { inv in
                 InvoiceDetailView(invoice: inv)
-                    .presentationDetents([.medium, .large])
-                    .presentationDragIndicator(.visible)
             }
         }
         .preferredColorScheme(.dark)
     }
-
-    // MARK: - 汇总卡片
 
     private var summaryCard: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -126,13 +116,10 @@ struct ContentView: View {
         .padding(.top, 8)
     }
 
-    // MARK: - 月份区块
-
     private func monthSection(_ group: (key: String, title: String, items: [Invoice], total: Double)) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text(group.title)
-                    .font(.headline)
+                Text(group.title).font(.headline)
                 Spacer()
                 Text(String(format: "¥%.2f", group.total))
                     .font(.subheadline.weight(.semibold))
@@ -147,15 +134,17 @@ struct ContentView: View {
                         .onTapGesture { selectedInvoice = inv }
                         .contextMenu {
                             Button(role: .destructive) {
-                                withAnimation { modelContext.delete(inv) }
+                                withAnimation {
+                                    modelContext.delete(inv)
+                                    try? modelContext.save()
+                                }
                             } label: {
                                 Label("删除", systemImage: "trash")
                             }
                         }
 
                     if index < group.items.count - 1 {
-                        Divider()
-                            .padding(.leading, 64)
+                        Divider().padding(.leading, 64)
                     }
                 }
             }
@@ -170,8 +159,6 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - 空状态
-
     private var emptyState: some View {
         VStack(spacing: 20) {
             Image(systemName: "doc.text.magnifyingglass")
@@ -179,23 +166,18 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
             Text("还没有发票")
                 .font(.title2.weight(.semibold))
-            Text("点右上角 + 添加，支持拍照、相册或从文件导入 PDF / 图片")
+            Text("点右上角 + ，支持手动填写、拍照、相册，或从文件一次导入多张电子发票 PDF")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 40)
 
-            Button {
-                showAdd = true
-            } label: {
-                Label("添加第一张发票", systemImage: "plus")
+            Button { showAdd = true } label: {
+                Label("添加发票", systemImage: "plus")
                     .font(.body.weight(.semibold))
                     .padding(.horizontal, 24)
                     .padding(.vertical, 12)
                     .background(.ultraThinMaterial, in: Capsule())
-                    .overlay {
-                        Capsule().strokeBorder(.white.opacity(0.2), lineWidth: 1)
-                    }
             }
             .padding(.top, 8)
         }
@@ -208,7 +190,6 @@ struct InvoiceRow: View {
     var body: some View {
         HStack(spacing: 14) {
             thumbnail
-
             VStack(alignment: .leading, spacing: 4) {
                 Text(invoice.vendor.isEmpty ? "未填商家" : invoice.vendor)
                     .font(.body.weight(.medium))
@@ -224,9 +205,7 @@ struct InvoiceRow: View {
                         .foregroundStyle(.secondary)
                 }
             }
-
             Spacer(minLength: 8)
-
             Text(String(format: "¥%.2f", invoice.amount))
                 .font(.body.weight(.semibold).monospacedDigit())
         }

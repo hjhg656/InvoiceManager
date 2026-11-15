@@ -1,6 +1,7 @@
 import SwiftUI
 import PhotosUI
 import UniformTypeIdentifiers
+import PDFKit
 
 struct AddInvoiceView: View {
     @Environment(\.modelContext) private var modelContext
@@ -13,20 +14,19 @@ struct AddInvoiceView: View {
     @State private var notes = ""
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var imageData: Data?
+    @State private var previewImage: UIImage?
     @State private var showCamera = false
-    @State private var showFileImporter = false
+    @State private var showDocPicker = false
     @State private var importSource = "manual"
-    @State private var importError: String?
-    @State private var importSuccess: String?
-    @State private var pendingFileCount = 0
+    @State private var statusMessage: String?
+    @State private var statusIsError = false
 
     private let categories = ["餐饮", "交通", "住宿", "办公", "通讯", "购物", "医疗", "其他"]
 
     var body: some View {
         NavigationStack {
             ZStack {
-                Color(red: 0.10, green: 0.11, blue: 0.16)
-                    .ignoresSafeArea()
+                Color(red: 0.10, green: 0.11, blue: 0.16).ignoresSafeArea()
 
                 Form {
                     Section {
@@ -36,9 +36,9 @@ struct AddInvoiceView: View {
                             .multilineTextAlignment(.center)
                             .padding(.vertical, 8)
                     } header: {
-                        Text("金额")
+                        Text("金额（必填）")
                     }
-                    .listRowBackground(glassRow)
+                    .listRowBackground(rowBG)
 
                     Section("基本信息") {
                         DatePicker("日期", selection: $date, displayedComponents: .date)
@@ -47,86 +47,59 @@ struct AddInvoiceView: View {
                             ForEach(categories, id: \.self) { Text($0) }
                         }
                     }
-                    .listRowBackground(glassRow)
+                    .listRowBackground(rowBG)
 
                     Section {
-                        if let imageData, let ui = UIImage(data: imageData) {
-                            Image(uiImage: ui)
+                        if let previewImage {
+                            Image(uiImage: previewImage)
                                 .resizable()
                                 .scaledToFit()
-                                .frame(maxHeight: 200)
+                                .frame(maxHeight: 220)
                                 .frame(maxWidth: .infinity)
-                                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                .clipShape(RoundedRectangle(cornerRadius: 12))
                                 .listRowInsets(EdgeInsets(top: 12, leading: 12, bottom: 12, trailing: 12))
-                                .listRowBackground(glassRow)
+                                .listRowBackground(rowBG)
                         } else if imageData != nil {
-                            HStack {
-                                Spacer()
-                                VStack(spacing: 8) {
-                                    Image(systemName: "doc.richtext.fill")
-                                        .font(.system(size: 40))
-                                        .foregroundStyle(.secondary)
-                                    Text("已选择 PDF 文件")
-                                        .font(.subheadline)
-                                        .foregroundStyle(.secondary)
-                                    if !amountText.isEmpty {
-                                        Text("识别金额 ¥\(amountText)")
-                                            .font(.caption)
-                                            .foregroundStyle(.green)
-                                    }
-                                }
-                                .padding(.vertical, 24)
-                                Spacer()
-                            }
-                            .listRowBackground(glassRow)
-                        }
-
-                        if let importSuccess {
-                            Text(importSuccess)
-                                .font(.footnote)
-                                .foregroundStyle(.green)
-                                .listRowBackground(Color.clear)
+                            Label("已附带文件（PDF）", systemImage: "doc.richtext.fill")
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 20)
+                                .listRowBackground(rowBG)
                         }
 
                         PhotosPicker(selection: $selectedPhoto, matching: .images) {
-                            importLabel(title: "从相册选择", icon: "photo.on.rectangle")
+                            rowLabel("从相册选择", "photo.on.rectangle")
                         }
-                        .listRowBackground(glassRow)
+                        .listRowBackground(rowBG)
 
-                        Button {
-                            showCamera = true
-                        } label: {
-                            importLabel(title: "拍照", icon: "camera")
+                        Button { showCamera = true } label: {
+                            rowLabel("拍照", "camera")
                         }
-                        .listRowBackground(glassRow)
+                        .listRowBackground(rowBG)
 
-                        Button {
-                            importError = nil
-                            importSuccess = nil
-                            showFileImporter = true
-                        } label: {
-                            importLabel(title: "从文件导入（可多选 PDF）", icon: "folder")
+                        Button { showDocPicker = true } label: {
+                            rowLabel("从文件导入 PDF / 图片（可多选）", "folder")
                         }
-                        .listRowBackground(glassRow)
+                        .listRowBackground(rowBG)
 
-                        if let importError {
-                            Text(importError)
+                        if let statusMessage {
+                            Text(statusMessage)
                                 .font(.footnote)
-                                .foregroundStyle(.red)
+                                .foregroundStyle(statusIsError ? .red : .green)
                                 .listRowBackground(Color.clear)
                         }
                     } header: {
-                        Text("发票文件 / 图片")
+                        Text("附件")
                     }
 
                     Section("备注") {
-                        TextField("可选备注", text: $notes, axis: .vertical)
-                            .lineLimit(3...6)
+                        TextField("可选", text: $notes, axis: .vertical)
+                            .lineLimit(2...5)
                     }
-                    .listRowBackground(glassRow)
+                    .listRowBackground(rowBG)
 
                     Section {
-                        Text("电子发票 PDF 文件名里通常带金额（如「约车-27.92元」），导入时会自动识别。可一次选多张批量导入。")
+                        Text("电子发票 PDF 可一次选多张，会自动按文件名识别金额并保存。")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
@@ -136,77 +109,47 @@ struct AddInvoiceView: View {
             }
             .navigationTitle("添加发票")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbarBackground(.ultraThinMaterial, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("取消") { dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(pendingFileCount > 1 ? "保存 \(pendingFileCount) 张" : "保存") {
-                        save()
-                    }
-                    .fontWeight(.semibold)
-                    .disabled(amountText.isEmpty && pendingFileCount == 0)
+                    Button("保存") { saveOne() }
+                        .fontWeight(.semibold)
+                        .disabled(!canSave)
                 }
             }
-            .onChange(of: selectedPhoto) { _, newItem in
-                Task {
-                    guard let newItem else { return }
-                    do {
-                        if let data = try await newItem.loadTransferable(type: Data.self) {
-                            await MainActor.run {
-                                imageData = data
-                                importSource = "photo"
-                                importError = nil
-                                importSuccess = "已选择相册图片"
-                                pendingFileCount = 0
-                            }
-                        }
-                    } catch {
-                        await MainActor.run {
-                            importError = "读取相册失败：\(error.localizedDescription)"
-                        }
-                    }
-                }
+            .onChange(of: selectedPhoto) { _, item in
+                Task { await loadPhoto(item) }
             }
             .fullScreenCover(isPresented: $showCamera) {
                 CameraPicker(imageData: $imageData)
                     .ignoresSafeArea()
-                    .onDisappear {
-                        if imageData != nil {
-                            importSource = "photo"
-                            importError = nil
-                            importSuccess = "已拍摄照片"
-                            pendingFileCount = 0
-                        }
-                    }
+                    .onDisappear { refreshPreviewFromImageData(source: "photo") }
             }
-            .fileImporter(
-                isPresented: $showFileImporter,
-                allowedContentTypes: [.pdf, .image, .jpeg, .png, .heic],
-                allowsMultipleSelection: true
-            ) { result in
-                // 必须在主线程处理，并先复制出沙盒
-                DispatchQueue.main.async {
-                    handleFileImport(result)
+            .sheet(isPresented: $showDocPicker) {
+                DocumentPicker { urls in
+                    importFiles(urls)
                 }
+                .ignoresSafeArea()
             }
         }
         .preferredColorScheme(.dark)
     }
 
-    private var glassRow: some View {
-        Color.white.opacity(0.06)
+    private var rowBG: some View { Color.white.opacity(0.06) }
+
+    private var canSave: Bool {
+        Double(amountText.replacingOccurrences(of: ",", with: "")) != nil
+            && !(amountText.trimmingCharacters(in: .whitespaces).isEmpty)
     }
 
-    private func importLabel(title: String, icon: String) -> some View {
-        HStack(spacing: 12) {
+    private func rowLabel(_ title: String, _ icon: String) -> some View {
+        HStack {
             Image(systemName: icon)
-                .font(.body)
-                .frame(width: 28)
                 .foregroundStyle(Color.accentColor)
-            Text(title)
-                .foregroundStyle(.primary)
+                .frame(width: 28)
+            Text(title).foregroundStyle(.primary)
             Spacer()
             Image(systemName: "chevron.right")
                 .font(.caption.weight(.semibold))
@@ -215,116 +158,155 @@ struct AddInvoiceView: View {
         .contentShape(Rectangle())
     }
 
-    // MARK: - 文件导入（关键修复）
+    // MARK: - Photo
 
-    private func handleFileImport(_ result: Result<[URL], Error>) {
-        switch result {
-        case .failure(let error):
-            // 用户取消也会走到这里，忽略取消
-            let ns = error as NSError
-            if ns.domain == NSCocoaErrorDomain && ns.code == NSUserCancelledError { return }
-            importError = "选择失败：\(error.localizedDescription)"
-
-        case .success(let urls):
-            guard !urls.isEmpty else {
-                importError = "未选择文件"
-                return
-            }
-
-            var successCount = 0
-            var lastData: Data?
-            var lastName = ""
-
-            for url in urls {
-                let accessed = url.startAccessingSecurityScopedResource()
-                defer {
-                    if accessed { url.stopAccessingSecurityScopedResource() }
-                }
-
-                // 先拷贝到临时目录，避免权限立刻失效
-                let tempURL = FileManager.default.temporaryDirectory
-                    .appendingPathComponent(UUID().uuidString + "-" + url.lastPathComponent)
-
-                do {
-                    if FileManager.default.fileExists(atPath: tempURL.path) {
-                        try FileManager.default.removeItem(at: tempURL)
-                    }
-                    try FileManager.default.copyItem(at: url, to: tempURL)
-                    let data = try Data(contentsOf: tempURL)
-                    try? FileManager.default.removeItem(at: tempURL)
-
-                    let fileName = url.deletingPathExtension().lastPathComponent
-                    let parsed = parseChineseEInvoice(fileName: fileName)
-
-                    if urls.count == 1 {
-                        // 单张：填到表单，等用户点保存
-                        imageData = data
-                        importSource = "file"
-                        lastData = data
-                        lastName = fileName
-                        if let amt = parsed.amount {
-                            amountText = String(format: "%.2f", amt)
-                        }
-                        if vendor.isEmpty, let v = parsed.vendor {
-                            vendor = v
-                        }
-                        category = "交通"
-                        pendingFileCount = 0
-                    } else {
-                        // 多张：直接入库
-                        let inv = Invoice(
-                            amount: parsed.amount ?? 0,
-                            date: date,
-                            vendor: parsed.vendor ?? fileName,
-                            category: "交通",
-                            notes: fileName,
-                            imageData: data,
-                            source: "file"
-                        )
-                        modelContext.insert(inv)
-                        successCount += 1
-                    }
-                } catch {
-                    importError = "读取 \(url.lastPathComponent) 失败：\(error.localizedDescription)"
+    private func loadPhoto(_ item: PhotosPickerItem?) async {
+        guard let item else { return }
+        do {
+            if let data = try await item.loadTransferable(type: Data.self) {
+                await MainActor.run {
+                    imageData = data
+                    previewImage = UIImage(data: data)
+                    importSource = "photo"
+                    setStatus("已选择相册图片", error: false)
                 }
             }
+        } catch {
+            await MainActor.run { setStatus("相册读取失败：\(error.localizedDescription)", error: true) }
+        }
+    }
 
-            if urls.count == 1 {
-                if lastData != nil {
-                    importSuccess = "已导入：\(lastName)"
-                    importError = nil
+    private func refreshPreviewFromImageData(source: String) {
+        guard let imageData else { return }
+        previewImage = UIImage(data: imageData)
+        importSource = source
+        setStatus("已添加图片", error: false)
+    }
+
+    // MARK: - Files (UIDocumentPicker)
+
+    private func importFiles(_ urls: [URL]) {
+        guard !urls.isEmpty else {
+            setStatus("未选择文件", error: true)
+            return
+        }
+
+        var saved = 0
+        var lastPreview: UIImage?
+        var lastData: Data?
+        var lastAmount = ""
+        var lastVendor = ""
+
+        for url in urls {
+            let didAccess = url.startAccessingSecurityScopedResource()
+            defer { if didAccess { url.stopAccessingSecurityScopedResource() } }
+
+            let temp = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString + "-" + url.lastPathComponent)
+
+            do {
+                if FileManager.default.fileExists(atPath: temp.path) {
+                    try FileManager.default.removeItem(at: temp)
                 }
-            } else if successCount > 0 {
-                importSuccess = "已批量导入 \(successCount) 张发票"
-                importError = nil
-                // 多选直接关掉添加页
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                    dismiss()
+                try FileManager.default.copyItem(at: url, to: temp)
+                let data = try Data(contentsOf: temp)
+                try? FileManager.default.removeItem(at: temp)
+
+                let name = url.deletingPathExtension().lastPathComponent
+                let parsed = parseFileName(name)
+
+                // 预览：PDF 渲第一页，图片直接显示
+                let preview = makePreview(data: data, urlHint: url)
+
+                if urls.count == 1 {
+                    // 单文件：填表，用户再点保存
+                    imageData = data
+                    previewImage = preview
+                    importSource = "file"
+                    if let a = parsed.amount {
+                        amountText = String(format: "%.2f", a)
+                        lastAmount = amountText
+                    }
+                    if vendor.isEmpty, let v = parsed.vendor {
+                        vendor = v
+                        lastVendor = v
+                    }
+                    category = "交通"
+                    notes = name
+                    lastData = data
+                    lastPreview = preview
+                } else {
+                    // 多文件：直接写入数据库
+                    let inv = Invoice(
+                        amount: parsed.amount ?? 0,
+                        date: date,
+                        vendor: parsed.vendor ?? name,
+                        category: "交通",
+                        notes: name,
+                        imageData: data,
+                        source: "file"
+                    )
+                    modelContext.insert(inv)
+                    saved += 1
                 }
+            } catch {
+                setStatus("无法读取 \(url.lastPathComponent)：\(error.localizedDescription)", error: true)
+            }
+        }
+
+        // 确保 SwiftData 落盘
+        try? modelContext.save()
+
+        if urls.count == 1 {
+            if lastData != nil {
+                var msg = "已载入文件"
+                if !lastAmount.isEmpty { msg += "，金额 ¥\(lastAmount)" }
+                if !lastVendor.isEmpty { msg += "，\(lastVendor)" }
+                msg += "。请点右上角保存。"
+                setStatus(msg, error: false)
+                _ = lastPreview
+            }
+        } else if saved > 0 {
+            setStatus("已导入 \(saved) 张发票", error: false)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                dismiss()
             }
         }
     }
 
-    /// 从常见电子发票文件名解析金额和商家
-    /// 例：【365约车特选-27.92元-1个行程】高德...子发票
-    private func parseChineseEInvoice(fileName: String) -> (amount: Double?, vendor: String?) {
+    private func makePreview(data: Data, urlHint: URL) -> UIImage? {
+        if let img = UIImage(data: data) { return img }
+        // PDF 第一页
+        if let doc = PDFDocument(data: data), let page = doc.page(at: 0) {
+            let rect = page.bounds(for: .mediaBox)
+            let scale: CGFloat = 2
+            let size = CGSize(width: rect.width * scale, height: rect.height * scale)
+            let renderer = UIGraphicsImageRenderer(size: size)
+            return renderer.image { ctx in
+                UIColor.white.setFill()
+                ctx.fill(CGRect(origin: .zero, size: size))
+                ctx.cgContext.translateBy(x: 0, y: size.height)
+                ctx.cgContext.scaleBy(x: scale, y: -scale)
+                page.draw(with: .mediaBox, to: ctx.cgContext)
+            }
+        }
+        return nil
+    }
+
+    private func parseFileName(_ fileName: String) -> (amount: Double?, vendor: String?) {
         var amount: Double?
         var vendor: String?
 
-        // 金额：xx.xx元 或 -xx.xx元
-        if let regex = try? NSRegularExpression(pattern: #"(\d+\.\d{1,2})\s*元"#) {
+        if let re = try? NSRegularExpression(pattern: #"(\d+\.\d{1,2})\s*元"#) {
             let range = NSRange(fileName.startIndex..., in: fileName)
-            if let match = regex.firstMatch(in: fileName, range: range),
-               let r = Range(match.range(at: 1), in: fileName) {
+            if let m = re.firstMatch(in: fileName, range: range),
+               let r = Range(m.range(at: 1), in: fileName) {
                 amount = Double(fileName[r])
             }
         }
 
-        // 商家：括号内第一段，去掉金额部分
-        if let start = fileName.firstIndex(of: "【"),
-           let end = fileName.firstIndex(of: "】") {
-            let inner = String(fileName[fileName.index(after: start)..<end])
-            // 取第一个 - 之前的部分作为商家
+        if let s = fileName.firstIndex(of: "【"), let e = fileName.firstIndex(of: "】") {
+            let inner = String(fileName[fileName.index(after: s)..<e])
             if let dash = inner.firstIndex(of: "-") {
                 vendor = String(inner[..<dash])
                     .replacingOccurrences(of: "特选", with: "")
@@ -332,19 +314,15 @@ struct AddInvoiceView: View {
             } else {
                 vendor = inner
             }
-        } else {
-            // 没有【】就取文件名前面一段
-            let parts = fileName.split(separator: "-")
-            if let first = parts.first {
-                vendor = String(first)
-            }
         }
-
         return (amount, vendor)
     }
 
-    private func save() {
-        let amount = Double(amountText.replacingOccurrences(of: ",", with: "")) ?? 0
+    private func saveOne() {
+        guard let amount = Double(amountText.replacingOccurrences(of: ",", with: "")) else {
+            setStatus("请填写有效金额", error: true)
+            return
+        }
         let inv = Invoice(
             amount: amount,
             date: date,
@@ -355,7 +333,42 @@ struct AddInvoiceView: View {
             source: importSource
         )
         modelContext.insert(inv)
+        try? modelContext.save()
         dismiss()
+    }
+
+    private func setStatus(_ text: String, error: Bool) {
+        statusMessage = text
+        statusIsError = error
+    }
+}
+
+// MARK: - 更可靠的文件选择器
+
+struct DocumentPicker: UIViewControllerRepresentable {
+    var onPick: ([URL]) -> Void
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let types: [UTType] = [.pdf, .image, .jpeg, .png, .heic]
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: true)
+        picker.allowsMultipleSelection = true
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick) }
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let onPick: ([URL]) -> Void
+        init(onPick: @escaping ([URL]) -> Void) { self.onPick = onPick }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            onPick(urls)
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {}
     }
 }
 
@@ -371,7 +384,6 @@ struct CameraPicker: UIViewControllerRepresentable {
     }
 
     func updateUIViewController(_ uiViewController: UIImagePickerController, context: Context) {}
-
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
     class Coordinator: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate {

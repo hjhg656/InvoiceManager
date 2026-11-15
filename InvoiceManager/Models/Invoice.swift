@@ -9,9 +9,9 @@ final class Invoice {
     var vendor: String
     var category: String
     var notes: String
-    var imageData: Data?
+    @Attribute(.externalStorage) var imageData: Data?
     var createdAt: Date
-    var source: String   // "manual" / "photo" / "email"
+    var source: String   // manual / photo / file / email
 
     init(
         amount: Double = 0,
@@ -33,7 +33,6 @@ final class Invoice {
         self.source = source
     }
 
-    /// 用于按月分组的 key，例如 "2026-11"
     var monthKey: String {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM"
