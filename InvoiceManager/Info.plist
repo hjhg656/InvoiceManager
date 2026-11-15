@@ -15,14 +15,16 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>1.1</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2</string>
 	<key>NSCameraUsageDescription</key>
 	<string>用于拍摄发票照片</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>用于从相册选择发票图片</string>
 	<key>UILaunchScreen</key>
 	<dict/>
+	<key>UISupportsDocumentBrowser</key>
+	<false/>
 </dict>
 </plist>
