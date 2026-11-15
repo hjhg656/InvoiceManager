@@ -9,8 +9,7 @@ struct InvoiceManagerApp: App {
         do {
             return try ModelContainer(for: schema, configurations: [config])
         } catch {
-            // 若模型变更导致迁移失败，重建容器（会清空旧数据）
-            print("ModelContainer error: \(error). Recreating...")
+            // 模型升级失败时重建（会清空旧库）
             try? FileManager.default.removeItem(at: config.url)
             return try! ModelContainer(for: schema, configurations: [config])
         }
