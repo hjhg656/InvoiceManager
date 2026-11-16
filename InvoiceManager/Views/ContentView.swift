@@ -18,6 +18,7 @@ struct ContentView: View {
     @State private var searchText = ""
     @State private var filterStatus: InvoiceStatus?
     @State private var filterKind: InvoiceKind?
+    @State private var filterMonthKey: String? = nil  // nil = 全部月份
     @State private var sharePayload: SharePayload?
     @State private var showRestore = false
     @State private var toast: String?
@@ -29,6 +30,7 @@ struct ContentView: View {
 
     private var filtered: [Invoice] {
         invoices.filter { inv in
+            if let filterMonthKey, inv.monthKey != filterMonthKey { return false }
             if let filterStatus, inv.status != filterStatus { return false }
             if let filterKind, inv.kind != filterKind { return false }
             if searchText.isEmpty { return true }
@@ -38,6 +40,17 @@ struct ContentView: View {
                 || inv.kind.rawValue.contains(q)
                 || inv.status.rawValue.contains(q)
                 || String(format: "%.2f", inv.amount).contains(q)
+        }
+    }
+
+    /// 所有出现过的月份（倒序）
+    private var allMonthOptions: [(key: String, title: String, count: Int, total: Double)] {
+        let dict = Dictionary(grouping: invoices, by: \.monthKey)
+        return dict.keys.sorted(by: >).compactMap { key in
+            guard let items = dict[key], !items.isEmpty else { return nil }
+            let title = items.first?.monthTitle ?? key
+            let total = items.reduce(0.0) { $0 + $1.amount }
+            return (key, title, items.count, total)
         }
     }
 
@@ -57,6 +70,12 @@ struct ContentView: View {
     private var selectedInvoices: [Invoice] {
         invoices.filter { selectedIds.contains($0.id) }
     }
+    private var allFilteredIds: Set<UUID> {
+        Set(filtered.map(\.id))
+    }
+    private var isAllSelected: Bool {
+        !filtered.isEmpty && allFilteredIds.isSubset(of: selectedIds)
+    }
 
     var body: some View {
         NavigationStack {
@@ -73,16 +92,14 @@ struct ContentView: View {
                     }
                 } else {
                     List {
-                        if !isSelecting {
+                        if isSelecting {
+                            selectionHeader
+                        } else {
                             statsSection
+                            monthJumpSection
                             filterSection
                             if !batches.isEmpty {
                                 batchEntrySection
-                            }
-                        } else {
-                            Section {
-                                Text("已选 \(selectedIds.count) 张，合计 ¥\(String(format: "%.2f", selectedInvoices.reduce(0) { $0 + $1.amount }))")
-                                    .font(.subheadline)
                             }
                         }
 
@@ -92,11 +109,7 @@ struct ContentView: View {
                                     invoiceRow(inv)
                                 }
                             } header: {
-                                HStack {
-                                    Text(group.title)
-                                    Spacer()
-                                    Text(String(format: "¥%.2f", group.total))
-                                }
+                                monthSectionHeader(group)
                             }
                         }
                     }
@@ -131,15 +144,127 @@ struct ContentView: View {
             .onAppear {
                 let n = InboxImporter.importPending(into: modelContext)
                 if n > 0 { showToast("从分享导入 \(n) 张发票") }
+                // 默认定位到最新月份，减少滑动
+                if filterMonthKey == nil, let latest = allMonthOptions.first?.key {
+                    filterMonthKey = latest
+                }
             }
         }
     }
 
+    // MARK: - Selection header
+
+    private var selectionHeader: some View {
+        Section {
+            HStack {
+                Text("已选 \(selectedIds.count) 张")
+                    .font(.subheadline.weight(.medium))
+                Spacer()
+                Text(String(format: "¥%.2f", selectedInvoices.reduce(0) { $0 + $1.amount }))
+                    .font(.subheadline.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(.orange)
+            }
+            HStack(spacing: 12) {
+                Button {
+                    if isAllSelected {
+                        selectedIds.subtract(allFilteredIds)
+                    } else {
+                        selectedIds.formUnion(allFilteredIds)
+                    }
+                } label: {
+                    Label(
+                        isAllSelected ? "取消全选" : "全选当前列表",
+                        systemImage: isAllSelected ? "checkmark.circle.fill" : "circle"
+                    )
+                    .font(.subheadline)
+                }
+                Spacer()
+                if filterMonthKey != nil {
+                    Text("仅当前月份")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    // MARK: - Month jump
+
+    private var monthJumpSection: some View {
+        Section {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    monthChip("全部", on: filterMonthKey == nil, subtitle: "\(invoices.count)张") {
+                        filterMonthKey = nil
+                    }
+                    ForEach(allMonthOptions, id: \.key) { m in
+                        monthChip(
+                            m.title,
+                            on: filterMonthKey == m.key,
+                            subtitle: String(format: "¥%.0f", m.total)
+                        ) {
+                            filterMonthKey = filterMonthKey == m.key ? nil : m.key
+                        }
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+        } header: {
+            Text("按月查看")
+        }
+    }
+
+    private func monthChip(_ title: String, on: Bool, subtitle: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 2) {
+                Text(title)
+                    .font(.caption.weight(.semibold))
+                Text(subtitle)
+                    .font(.caption2)
+                    .opacity(0.85)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(on ? Color.accentColor : Color(.tertiarySystemFill), in: RoundedRectangle(cornerRadius: 10))
+            .foregroundStyle(on ? .white : .primary)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func monthSectionHeader(_ group: (key: String, title: String, items: [Invoice], total: Double)) -> some View {
+        HStack {
+            Text(group.title)
+                .font(.subheadline.weight(.semibold))
+            Text("\(group.items.count) 张")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Text(String(format: "¥%.2f", group.total))
+                .font(.subheadline.monospacedDigit().weight(.medium))
+            if isSelecting {
+                Button {
+                    let ids = Set(group.items.map(\.id))
+                    if ids.isSubset(of: selectedIds) {
+                        selectedIds.subtract(ids)
+                    } else {
+                        selectedIds.formUnion(ids)
+                    }
+                } label: {
+                    Text(Set(group.items.map(\.id)).isSubset(of: selectedIds) ? "取消" : "全选")
+                        .font(.caption.weight(.medium))
+                }
+            }
+        }
+    }
+
+    // MARK: - Rows
+
     @ViewBuilder
     private func invoiceRow(_ inv: Invoice) -> some View {
         if isSelecting {
-            HStack {
+            HStack(spacing: 10) {
                 Image(systemName: selectedIds.contains(inv.id) ? "checkmark.circle.fill" : "circle")
+                    .font(.title3)
                     .foregroundStyle(selectedIds.contains(inv.id) ? Color.accentColor : .secondary)
                 InvoiceRow(invoice: inv)
             }
@@ -171,24 +296,35 @@ struct ContentView: View {
     }
 
     private var statsSection: some View {
-        Section("统计（当前筛选）") {
-            HStack {
-                VStack(alignment: .leading) {
+        Section {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
                     Text("合计").font(.caption).foregroundStyle(.secondary)
                     Text(String(format: "¥%.2f", totalAmount))
                         .font(.title2.weight(.bold).monospacedDigit())
                 }
                 Spacer()
-                VStack(alignment: .trailing) {
+                VStack(alignment: .trailing, spacing: 4) {
                     Text("待提交").font(.caption).foregroundStyle(.secondary)
                     Text(String(format: "¥%.2f", pendingAmount))
                         .font(.title3.weight(.semibold).monospacedDigit())
                         .foregroundStyle(.orange)
                 }
             }
-            Text("\(filtered.count) 张发票 · \(batches.count) 个批次")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            HStack {
+                Text("\(filtered.count) 张")
+                if let key = filterMonthKey,
+                   let title = allMonthOptions.first(where: { $0.key == key })?.title {
+                    Text("· \(title)")
+                } else {
+                    Text("· 全部月份")
+                }
+                if batches.count > 0 {
+                    Text("· \(batches.count) 批次")
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
     }
 
@@ -269,6 +405,15 @@ struct ContentView: View {
         }
         ToolbarItemGroup(placement: .topBarTrailing) {
             if isSelecting {
+                Button {
+                    if isAllSelected {
+                        selectedIds.subtract(allFilteredIds)
+                    } else {
+                        selectedIds.formUnion(allFilteredIds)
+                    }
+                } label: {
+                    Text(isAllSelected ? "取消全选" : "全选")
+                }
                 Menu {
                     Button("标为待提交") { batchSetStatus(.pending) }
                     Button("标为已上交") { batchSetStatus(.submitted) }
