@@ -21,20 +21,47 @@ enum InvoiceKind: String, Codable, CaseIterable, Identifiable {
 }
 
 @Model
+final class ExpenseBatch {
+    @Attribute(.unique) var id: UUID
+    var name: String
+    var note: String
+    var createdAt: Date
+
+    @Relationship(deleteRule: .nullify, inverse: \Invoice.batch)
+    var invoices: [Invoice]?
+
+    init(name: String, note: String = "") {
+        self.id = UUID()
+        self.name = name
+        self.note = note
+        self.createdAt = Date()
+        self.invoices = []
+    }
+
+    var totalAmount: Double {
+        (invoices ?? []).reduce(0) { $0 + $1.amount }
+    }
+
+    var count: Int { (invoices ?? []).count }
+}
+
+@Model
 final class Invoice {
     @Attribute(.unique) var id: UUID
     var amount: Double
     var date: Date
     var vendor: String
-    var category: String          // 兼容旧字段，与 kind 同步
-    var kindRaw: String           // InvoiceKind.rawValue
-    var statusRaw: String         // InvoiceStatus.rawValue
+    var category: String
+    var kindRaw: String
+    var statusRaw: String
     var notes: String
     var imageData: Data?
     var fileName: String?
     var ocrText: String?
     var createdAt: Date
     var source: String
+
+    var batch: ExpenseBatch?
 
     init(
         amount: Double = 0,
