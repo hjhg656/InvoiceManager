@@ -20,6 +20,7 @@
 		30000000000000000000002A /* IMAPClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30000000000000000000001C /* IMAPClient.swift */; };
 		30000000000000000000002B /* EmailImportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30000000000000000000001D /* EmailImportView.swift */; };
 		30000000000000000000002C /* MIMEDecoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30000000000000000000001E /* MIMEDecoder.swift */; };
+		30000000000000000000002D /* ZipExtractor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30000000000000000000001F /* ZipExtractor.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -38,6 +39,7 @@
 		30000000000000000000001C /* IMAPClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMAPClient.swift; sourceTree = "<group>"; };
 		30000000000000000000001D /* EmailImportView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EmailImportView.swift; sourceTree = "<group>"; };
 		30000000000000000000001E /* MIMEDecoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MIMEDecoder.swift; sourceTree = "<group>"; };
+		30000000000000000000001F /* ZipExtractor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZipExtractor.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -92,6 +94,7 @@
 				30000000000000000000001B /* EmailAccountStore.swift */,
 				30000000000000000000001C /* IMAPClient.swift */,
 				30000000000000000000001E /* MIMEDecoder.swift */,
+				30000000000000000000001F /* ZipExtractor.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -184,6 +187,7 @@
 				30000000000000000000002A /* IMAPClient.swift in Sources */,
 				30000000000000000000002B /* EmailImportView.swift in Sources */,
 				30000000000000000000002C /* MIMEDecoder.swift in Sources */,
+				30000000000000000000002D /* ZipExtractor.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -221,7 +225,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 6;
+				CURRENT_PROJECT_VERSION = 7;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = InvoiceManager/Info.plist;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -230,7 +234,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.5;
+				MARKETING_VERSION = 1.6;
 				PRODUCT_BUNDLE_IDENTIFIER = com.example.InvoiceManager;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_VERSION = 5.0;
@@ -242,7 +246,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 6;
+				CURRENT_PROJECT_VERSION = 7;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = InvoiceManager/Info.plist;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -251,7 +255,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.5;
+				MARKETING_VERSION = 1.6;
 				PRODUCT_BUNDLE_IDENTIFIER = com.example.InvoiceManager;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
