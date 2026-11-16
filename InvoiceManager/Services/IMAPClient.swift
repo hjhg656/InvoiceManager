@@ -19,7 +19,7 @@ enum IMAPError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .connectionFailed(let s): return "连接失败：\(s)"
-        case .loginFailed(let s): return "登录失败：\(s)\n请确认已开启 IMAP，并使用授权码（不是登录密码）"
+        case .loginFailed(let s): return "登录失败：\(s)\n请确认已开启 IMAP，并使用授权码"
         case .commandFailed(let s): return s
         case .timeout: return "连接超时，请检查网络或服务器地址"
         case .cancelled: return "已取消"
@@ -27,11 +27,9 @@ enum IMAPError: LocalizedError {
     }
 }
 
-/// 精简、防崩溃的 IMAP 客户端
 final class IMAPClient: @unchecked Sendable {
     private let host: String
     private let port: UInt16
-
     private let queue = DispatchQueue(label: "imap.client")
     private var connection: NWConnection?
     private var buffer = Data()
@@ -47,7 +45,7 @@ final class IMAPClient: @unchecked Sendable {
     func fetchInvoiceAttachments(
         email: String,
         password: String,
-        limit: Int = 25
+        limit: Int = 30
     ) async throws -> [EmailAttachment] {
         try await connect(timeout: 20)
         defer { close() }
@@ -56,17 +54,17 @@ final class IMAPClient: @unchecked Sendable {
         try await login(email: email, password: password)
         try await selectInbox()
 
-        let uids = try await searchRecent(limit: limit)
-        var results: [EmailAttachment] = []
+        // 优先搜带「发票」的邮件；失败再退回最近邮件
+        var uids = try await searchInvoiceRelated(limit: limit)
+        if uids.isEmpty {
+            uids = try await searchRecent(limit: limit)
+        }
 
+        var results: [EmailAttachment] = []
         for uid in uids {
-            if results.count >= 30 { break }
-            do {
-                let atts = try await fetchMessageAttachments(uid: uid)
+            if results.count >= 40 { break }
+            if let atts = try? await fetchMessageAttachments(uid: uid) {
                 results.append(contentsOf: atts)
-            } catch {
-                // 单封失败跳过，不崩
-                continue
             }
         }
         return results
@@ -80,14 +78,12 @@ final class IMAPClient: @unchecked Sendable {
 
         let tls = NWProtocolTLS.Options()
         let params = NWParameters(tls: tls, tcp: NWProtocolTCP.Options())
-        params.expiredDNSBehavior = .allow
-
         let conn = NWConnection(
             host: NWEndpoint.Host(host),
             port: NWEndpoint.Port(rawValue: port) ?? 993,
             using: params
         )
-        self.connection = conn
+        connection = conn
 
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             let once = OnceFlag()
@@ -104,10 +100,7 @@ final class IMAPClient: @unchecked Sendable {
             conn.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
-                    if once.mark() {
-                        timer.cancel()
-                        cont.resume()
-                    }
+                    if once.mark() { timer.cancel(); cont.resume() }
                 case .failed(let err):
                     if once.mark() {
                         timer.cancel()
@@ -118,8 +111,7 @@ final class IMAPClient: @unchecked Sendable {
                         timer.cancel()
                         cont.resume(throwing: IMAPError.cancelled)
                     }
-                default:
-                    break
+                default: break
                 }
             }
             conn.start(queue: self.queue)
@@ -132,8 +124,7 @@ final class IMAPClient: @unchecked Sendable {
             guard let self, !self.closed else { return }
             if let data, !data.isEmpty {
                 self.bufferLock.lock()
-                // 防止内存暴涨
-                if self.buffer.count < 8 * 1024 * 1024 {
+                if self.buffer.count < 10 * 1024 * 1024 {
                     self.buffer.append(data)
                 }
                 self.bufferLock.unlock()
@@ -150,8 +141,6 @@ final class IMAPClient: @unchecked Sendable {
         connection = nil
         bufferLock.lock(); buffer.removeAll(); bufferLock.unlock()
     }
-
-    // MARK: - Protocol helpers
 
     private func nextTag() -> String {
         tagCounter += 1
@@ -176,18 +165,14 @@ final class IMAPClient: @unchecked Sendable {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             let text = currentText()
-            if text.contains("* OK") || text.uppercased().contains("IMAP") {
-                return
-            }
+            if text.contains("* OK") || text.uppercased().contains("IMAP") { return }
             try await Task.sleep(nanoseconds: 40_000_000)
         }
-        throw IMAPError.connectionFailed("服务器无响应（问候超时）")
+        throw IMAPError.connectionFailed("服务器无响应")
     }
 
     private func runCommand(_ command: String, timeout: TimeInterval = 25) async throws -> String {
         let tag = nextTag()
-        // 清空旧缓冲里已完成的残留（保留未完成数据太危险，简单清空）
-        // 注意：不能清空，否则吞掉未读数据；只发命令再等到 tag
         try await sendLine("\(tag) \(command)")
         return try await readUntilTagged(tag, timeout: timeout)
     }
@@ -202,15 +187,11 @@ final class IMAPClient: @unchecked Sendable {
             bufferLock.lock()
             let snapshot = buffer
             bufferLock.unlock()
-
-            // 用 latin1 保留字节
             let text = String(data: snapshot, encoding: .isoLatin1) ?? ""
 
             if let range = text.range(of: "\r\n\(okPrefix)")
                 ?? text.range(of: "\n\(okPrefix)")
                 ?? text.range(of: okPrefix) {
-                // 找到标签行结尾
-                let fromStart = text[..<range.upperBound]
                 var endIdx = range.upperBound
                 if let lineEnd = text.range(of: "\r\n", range: endIdx..<text.endIndex) {
                     endIdx = lineEnd.upperBound
@@ -218,45 +199,33 @@ final class IMAPClient: @unchecked Sendable {
                     endIdx = lineEnd.upperBound
                 }
                 let collected = String(text[..<endIdx])
-                // 消费
                 let consumed = collected.data(using: .isoLatin1)?.count ?? 0
                 bufferLock.lock()
-                if buffer.count >= consumed {
-                    buffer.removeFirst(consumed)
-                } else {
-                    buffer.removeAll()
-                }
+                if buffer.count >= consumed { buffer.removeFirst(consumed) }
+                else { buffer.removeAll() }
                 bufferLock.unlock()
                 return collected
             }
 
             if text.contains(noPrefix) || text.contains(badPrefix) {
-                // 取最后几行当错误信息
                 let lines = text.components(separatedBy: "\r\n").filter { !$0.isEmpty }
                 let msg = lines.suffix(3).joined(separator: " | ")
                 bufferLock.lock(); buffer.removeAll(); bufferLock.unlock()
                 throw IMAPError.commandFailed(msg)
             }
-
             try await Task.sleep(nanoseconds: 40_000_000)
         }
         throw IMAPError.timeout
     }
 
     private func currentText() -> String {
-        bufferLock.lock()
-        let d = buffer
-        bufferLock.unlock()
+        bufferLock.lock(); let d = buffer; bufferLock.unlock()
         return String(data: d, encoding: .isoLatin1) ?? ""
     }
 
-    // MARK: - Commands
-
     private func login(email: String, password: String) async throws {
-        let user = imapQuote(email)
-        let pass = imapQuote(password)
         do {
-            _ = try await runCommand("LOGIN \(user) \(pass)", timeout: 20)
+            _ = try await runCommand("LOGIN \(imapQuote(email)) \(imapQuote(password))", timeout: 20)
         } catch {
             if case IMAPError.commandFailed(let msg) = error {
                 throw IMAPError.loginFailed(msg)
@@ -269,9 +238,23 @@ final class IMAPClient: @unchecked Sendable {
         _ = try await runCommand("SELECT INBOX", timeout: 15)
     }
 
+    private func searchInvoiceRelated(limit: Int) async throws -> [Int] {
+        // 主题含 发票 / 高德 / 滴滴
+        let keywords = ["发票", "高德", "滴滴", "行程"]
+        var all: Set<Int> = []
+        for kw in keywords {
+            // CHARSET UTF-8 部分服务器支持
+            if let resp = try? await runCommand("UID SEARCH SUBJECT \(imapQuote(kw))", timeout: 20) {
+                parseSearchUIDs(resp).forEach { all.insert($0) }
+            }
+        }
+        let sorted = all.sorted()
+        return Array(sorted.suffix(limit).reversed())
+    }
+
     private func searchRecent(limit: Int) async throws -> [Int] {
         let cal = Calendar.current
-        let since = cal.date(byAdding: .day, value: -45, to: Date()) ?? Date()
+        let since = cal.date(byAdding: .day, value: -60, to: Date()) ?? Date()
         let df = DateFormatter()
         df.locale = Locale(identifier: "en_US_POSIX")
         df.timeZone = TimeZone(secondsFromGMT: 0)
@@ -282,12 +265,10 @@ final class IMAPClient: @unchecked Sendable {
         do {
             resp = try await runCommand("UID SEARCH SINCE \(sinceStr)", timeout: 30)
         } catch {
-            // 部分服务器不支持 SINCE，退回 ALL 再截断
             let all = try await runCommand("UID SEARCH ALL", timeout: 30)
-            return parseSearchUIDs(all).suffix(limit).reversed()
+            return Array(parseSearchUIDs(all).suffix(limit).reversed())
         }
-        let uids = parseSearchUIDs(resp)
-        return Array(uids.suffix(limit).reversed())
+        return Array(parseSearchUIDs(resp).suffix(limit).reversed())
     }
 
     private func parseSearchUIDs(_ resp: String) -> [Int] {
@@ -302,18 +283,17 @@ final class IMAPClient: @unchecked Sendable {
     }
 
     private func fetchMessageAttachments(uid: Int) async throws -> [EmailAttachment] {
-        // 先拉头，缩小范围
         let headerResp = try await runCommand(
-            "UID FETCH \(uid) (BODY.PEEK[HEADER.FIELDS (SUBJECT DATE CONTENT-TYPE)])",
+            "UID FETCH \(uid) (BODY.PEEK[HEADER.FIELDS (SUBJECT DATE)])",
             timeout: 20
         )
-        let subject = headerField(headerResp, "Subject") ?? ""
+        var subject = headerField(headerResp, "Subject") ?? ""
+        subject = MIMEDecoder.decodeEncodedWords(subject)
         let date = parseEmailDate(headerField(headerResp, "Date"))
 
-        // 拉全文（限制超时，单封过大则跳过）
         let full: String
         do {
-            full = try await runCommand("UID FETCH \(uid) BODY.PEEK[]", timeout: 45)
+            full = try await runCommand("UID FETCH \(uid) BODY.PEEK[]", timeout: 50)
         } catch {
             return []
         }
@@ -322,44 +302,35 @@ final class IMAPClient: @unchecked Sendable {
         return parseAttachments(from: literal, subject: subject, date: date)
     }
 
-    // MARK: - MIME
-
     private func extractLargestLiteral(from response: String) -> Data? {
-        // 找所有 {size} 并取最大的那块
         var best: Data?
         var bestSize = 0
         var search = response.startIndex
 
         while search < response.endIndex {
             guard let open = response.range(of: "{", range: search..<response.endIndex),
-                  let close = response.range(of: "}", range: open.upperBound..<response.endIndex) else {
-                break
-            }
+                  let close = response.range(of: "}", range: open.upperBound..<response.endIndex) else { break }
             let sizeStr = response[open.upperBound..<close.lowerBound]
                 .trimmingCharacters(in: .whitespaces)
-            // 可能带 + 号
-            let cleaned = sizeStr.replacingOccurrences(of: "+", with: "")
-            guard let size = Int(cleaned), size > 50 else {
+                .replacingOccurrences(of: "+", with: "")
+            guard let size = Int(sizeStr), size > 50 else {
                 search = close.upperBound
                 continue
             }
-
             var payloadStart = close.upperBound
             if response[payloadStart...].hasPrefix("\r\n") {
                 payloadStart = response.index(payloadStart, offsetBy: 2)
             } else if response[payloadStart...].hasPrefix("\n") {
                 payloadStart = response.index(payloadStart, offsetBy: 1)
             }
-
-            let raw = String(response[payloadStart...])
-            guard let data = raw.data(using: .isoLatin1) else {
+            guard let data = String(response[payloadStart...]).data(using: .isoLatin1) else {
                 search = close.upperBound
                 continue
             }
-            let slice = data.prefix(size)
+            let slice = Data(data.prefix(size))
             if slice.count > bestSize {
                 bestSize = slice.count
-                best = Data(slice)
+                best = slice
             }
             search = close.upperBound
         }
@@ -367,17 +338,15 @@ final class IMAPClient: @unchecked Sendable {
     }
 
     private func parseAttachments(from data: Data, subject: String, date: Date?) -> [EmailAttachment] {
-        // 整封就是 PDF
         if isPDF(data) {
-            return [EmailAttachment(fileName: "invoice.pdf", data: data, subject: subject, date: date)]
+            let name = defaultFileName(subject: subject, ext: "pdf")
+            return [EmailAttachment(fileName: name, data: data, subject: subject, date: date)]
         }
 
         guard let text = String(data: data, encoding: .isoLatin1) else { return [] }
-
         guard let boundary = findBoundary(in: text) else {
-            // 非 multipart，尝试当图片
             if isJPEG(data) || isPNG(data) {
-                return [EmailAttachment(fileName: "invoice.jpg", data: data, subject: subject, date: date)]
+                return [EmailAttachment(fileName: defaultFileName(subject: subject, ext: "jpg"), data: data, subject: subject, date: date)]
             }
             return []
         }
@@ -388,19 +357,15 @@ final class IMAPClient: @unchecked Sendable {
         for part in parts {
             if part.count < 80 { continue }
             let lower = part.lowercased()
-
-            let looksPDF = lower.contains("application/pdf")
-                || lower.contains(".pdf")
-            let looksImg = lower.contains("image/jpeg")
-                || lower.contains("image/png")
-                || lower.contains("image/jpg")
-                || lower.contains(".jpg")
-                || lower.contains(".jpeg")
-                || lower.contains(".png")
-
+            let looksPDF = lower.contains("application/pdf") || lower.contains(".pdf")
+            let looksImg = lower.contains("image/jpeg") || lower.contains("image/png")
+                || lower.contains(".jpg") || lower.contains(".jpeg") || lower.contains(".png")
             guard looksPDF || looksImg else { continue }
 
-            let fileName = extractFileName(part) ?? (looksPDF ? "invoice.pdf" : "invoice.jpg")
+            var fileName = extractFileName(part)
+            if let fn = fileName {
+                fileName = MIMEDecoder.decodeEncodedWords(fn.removingPercentEncoding ?? fn)
+            }
 
             guard let headerEnd = part.range(of: "\r\n\r\n") ?? part.range(of: "\n\n") else { continue }
             var body = String(part[headerEnd.upperBound...])
@@ -414,33 +379,55 @@ final class IMAPClient: @unchecked Sendable {
                 let cleaned = body.components(separatedBy: CharacterSet.whitespacesAndNewlines).joined()
                 payload = Data(base64Encoded: cleaned, options: .ignoreUnknownCharacters)
             } else if lower.contains("quoted-printable") {
-                payload = decodeQP(body)
+                payload = MIMEDecoder.decodeQuotedPrintableData(body)
             } else {
                 payload = body.data(using: .isoLatin1)
             }
 
-            guard var bytes = payload, bytes.count >= 800 else { continue }
-            // 截掉可能的尾部垃圾
-            if looksPDF, let range = bytes.range(of: Data([0x25, 0x25, 0x45, 0x4F, 0x46])) { // %%EOF
-                bytes = bytes.prefix(upTo: range.upperBound)
+            guard var bytes = payload, bytes.count >= 500 else { continue }
+
+            // 必须是真 PDF / 图片，过滤掉解码失败的垃圾
+            let okPDF = isPDF(bytes)
+            let okImg = isJPEG(bytes) || isPNG(bytes)
+            guard okPDF || okImg else { continue }
+
+            if okPDF, let range = bytes.range(of: Data([0x25, 0x25, 0x45, 0x4F, 0x46])) {
+                bytes = Data(bytes.prefix(upTo: range.upperBound))
             }
-            result.append(EmailAttachment(fileName: fileName, data: bytes, subject: subject, date: date))
+
+            let finalName: String
+            if let fileName, !fileName.isEmpty, !fileName.lowercased().hasPrefix("invoice") {
+                finalName = fileName
+            } else {
+                finalName = defaultFileName(subject: subject, ext: okPDF ? "pdf" : "jpg")
+            }
+
+            result.append(EmailAttachment(fileName: finalName, data: bytes, subject: subject, date: date))
         }
         return result
+    }
+
+    private func defaultFileName(subject: String, ext: String) -> String {
+        if let v = MIMEDecoder.vendorFromSubject(subject) {
+            return "\(v).\(ext)"
+        }
+        if !subject.isEmpty {
+            let safe = subject
+                .replacingOccurrences(of: "/", with: "-")
+                .prefix(30)
+            return "\(safe).\(ext)"
+        }
+        return "电子发票.\(ext)"
     }
 
     private func findBoundary(in text: String) -> String? {
         let lower = text.lowercased()
         guard let r = lower.range(of: "boundary=") else { return nil }
-        // 在原文对应位置截
         let origin = text.index(text.startIndex, offsetBy: lower.distance(from: lower.startIndex, to: r.upperBound))
-        var rest = String(text[origin...])
-        rest = rest.trimmingCharacters(in: .whitespaces)
+        var rest = String(text[origin...]).trimmingCharacters(in: .whitespaces)
         if rest.hasPrefix("\"") {
             rest = String(rest.dropFirst())
-            if let end = rest.firstIndex(of: "\"") {
-                return String(rest[..<end])
-            }
+            if let end = rest.firstIndex(of: "\"") { return String(rest[..<end]) }
         }
         let cut = rest.prefix(while: { !$0.isWhitespace && $0 != ";" && $0 != "\r" && $0 != "\n" })
         let b = String(cut).trimmingCharacters(in: CharacterSet(charactersIn: "\""))
@@ -459,22 +446,32 @@ final class IMAPClient: @unchecked Sendable {
             let range = NSRange(part.startIndex..., in: part)
             if let m = re.firstMatch(in: part, range: range),
                let r = Range(m.range(at: 1), in: part) {
-                var name = String(part[r])
-                name = name.removingPercentEncoding ?? name
-                return name.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+                return String(part[r]).trimmingCharacters(in: CharacterSet(charactersIn: "\""))
             }
         }
         return nil
     }
 
     private func headerField(_ text: String, _ name: String) -> String? {
-        let lines = text.components(separatedBy: CharacterSet.newlines)
+        // 支持折行头
+        let lines = text.components(separatedBy: "\r\n")
         let key = name.lowercased() + ":"
-        for line in lines {
-            let t = line.trimmingCharacters(in: .whitespaces)
+        var i = 0
+        while i < lines.count {
+            let t = lines[i].trimmingCharacters(in: .whitespaces)
             if t.lowercased().hasPrefix(key) {
-                return t.dropFirst(key.count).trimmingCharacters(in: .whitespaces)
+                var value = String(t.dropFirst(key.count)).trimmingCharacters(in: .whitespaces)
+                var j = i + 1
+                while j < lines.count {
+                    let next = lines[j]
+                    if next.hasPrefix(" ") || next.hasPrefix("\t") {
+                        value += " " + next.trimmingCharacters(in: .whitespaces)
+                        j += 1
+                    } else { break }
+                }
+                return value
             }
+            i += 1
         }
         return nil
     }
@@ -497,32 +494,8 @@ final class IMAPClient: @unchecked Sendable {
     }
 
     private func imapQuote(_ s: String) -> String {
-        "\"" + s
-            .replacingOccurrences(of: "\\", with: "\\\\")
+        "\"" + s.replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"") + "\""
-    }
-
-    private func decodeQP(_ s: String) -> Data? {
-        var out = Data()
-        let bytes = Array(s.utf8)
-        var i = 0
-        while i < bytes.count {
-            if bytes[i] == 61, i + 2 < bytes.count {
-                let hex = String(bytes: [bytes[i+1], bytes[i+2]], encoding: .ascii) ?? ""
-                if let b = UInt8(hex, radix: 16) {
-                    out.append(b)
-                    i += 3
-                    continue
-                }
-            }
-            if bytes[i] == 13 || bytes[i] == 10 {
-                i += 1
-                continue
-            }
-            out.append(bytes[i])
-            i += 1
-        }
-        return out
     }
 
     private func isPDF(_ d: Data) -> Bool {
@@ -536,13 +509,11 @@ final class IMAPClient: @unchecked Sendable {
     }
 }
 
-/// 保证 continuation 只 resume 一次
 private final class OnceFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var done = false
     func mark() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
+        lock.lock(); defer { lock.unlock() }
         if done { return false }
         done = true
         return true
