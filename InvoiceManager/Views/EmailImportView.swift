@@ -78,9 +78,7 @@ struct EmailImportView: View {
             }
 
             Section {
-                Button {
-                    startFetch()
-                } label: {
+                Button { startFetch() } label: {
                     if isLoading {
                         HStack {
                             ProgressView()
@@ -105,14 +103,12 @@ struct EmailImportView: View {
 
             if let errorText {
                 Section {
-                    Text(errorText)
-                        .foregroundStyle(.red)
-                        .font(.footnote)
+                    Text(errorText).foregroundStyle(.red).font(.footnote)
                 }
             }
 
             Section("说明") {
-                Text("必须使用「授权码 / 应用专用密码」。\n\n• QQ：设置 → 账户 → 开启 IMAP → 生成授权码\n• 163：设置 → IMAP → 授权码\n• Gmail：两步验证 → 应用专用密码\n\n扫描最近 45 天收件箱中的 PDF / 图片附件。")
+                Text("使用授权码登录。导入时会 OCR 识别金额和商家；识别不出可稍后在详情里改。")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -133,16 +129,16 @@ struct EmailImportView: View {
                         Image(systemName: selected.contains(att.id) ? "checkmark.circle.fill" : "circle")
                             .foregroundStyle(selected.contains(att.id) ? Color.accentColor : .secondary)
                         VStack(alignment: .leading, spacing: 4) {
-                            Text(att.fileName)
+                            Text(displayTitle(att))
                                 .font(.subheadline.weight(.medium))
                                 .lineLimit(2)
-                            Text(att.subject.isEmpty ? "无主题" : att.subject)
+                            Text(att.subject.isEmpty ? att.fileName : att.subject)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
                             HStack {
                                 if let d = att.date {
-                                    Text(d, format: .dateTime.month().day().hour().minute())
+                                    Text(d, format: .dateTime.month().day())
                                 }
                                 Text(ByteCountFormatter.string(fromByteCount: Int64(att.data.count), countStyle: .file))
                             }
@@ -165,7 +161,7 @@ struct EmailImportView: View {
                     if isLoading {
                         HStack {
                             ProgressView()
-                            Text("正在导入…")
+                            Text("识别并导入中…")
                         }
                     } else {
                         Text("导入所选（\(selected.count)）")
@@ -182,6 +178,16 @@ struct EmailImportView: View {
                 }
             }
         }
+    }
+
+    private func displayTitle(_ att: EmailAttachment) -> String {
+        let parsed = OCRService.parseFileName(att.fileName + " " + att.subject)
+        if let v = parsed.vendor, !OCRService.isGenericName(v) { return v }
+        if !att.subject.isEmpty, !OCRService.isGenericName(att.subject) {
+            return OCRService.cleanVendor(att.subject)
+        }
+        let base = OCRService.fromFileName(att.fileName)
+        return OCRService.isGenericName(base) ? att.fileName : base
     }
 
     private func restoreAccount() {
@@ -206,8 +212,7 @@ struct EmailImportView: View {
         statusText = "正在连接 \(host)…"
 
         let portNum = Int(port) ?? 993
-        let account = EmailAccount(email: email, host: host, port: portNum, useTLS: true)
-        EmailAccountStore.saveAccount(account)
+        EmailAccountStore.saveAccount(EmailAccount(email: email, host: host, port: portNum, useTLS: true))
         EmailAccountStore.savePassword(password, account: email)
 
         let hostCopy = host
@@ -226,18 +231,19 @@ struct EmailImportView: View {
                     password: passwordCopy,
                     limit: 25
                 )
+                // 过滤太小的垃圾附件
+                let filtered = list.filter { $0.data.count >= 1500 }
 
                 try Task.checkCancellation()
 
                 await MainActor.run {
-                    attachments = list
-                    selected = Set(list.map(\.id))
-                    statusText = list.isEmpty
-                        ? "未找到 PDF/图片附件。请确认授权码正确，且近期邮件里有发票附件。"
-                        : "找到 \(list.count) 个附件，请勾选后导入"
+                    attachments = filtered
+                    selected = Set(filtered.map(\.id))
+                    statusText = filtered.isEmpty
+                        ? "未找到有效 PDF/图片附件"
+                        : "找到 \(filtered.count) 个附件，导入时会自动识别金额"
                     phase = .results
                     isLoading = false
-                    statusText = statusText
                 }
             } catch is CancellationError {
                 await MainActor.run {
@@ -259,18 +265,30 @@ struct EmailImportView: View {
         isLoading = true
         var count = 0
         let chosen = attachments.filter { selected.contains($0.id) }
+
         for att in chosen {
-            let base = (att.fileName as NSString).deletingPathExtension
-            let fileParsed = OCRService.parseFileName(base)
-            let ocr = await OCRService.recognize(from: att.data)
+            let ocr = await OCRService.enrich(
+                data: att.data,
+                fileName: att.fileName,
+                subject: att.subject
+            )
+
+            let vendor: String
+            if let v = ocr.vendor, !OCRService.isGenericName(v) {
+                vendor = v
+            } else if !att.subject.isEmpty, !OCRService.isGenericName(att.subject) {
+                vendor = OCRService.cleanVendor(att.subject)
+            } else {
+                vendor = OCRService.fromFileName(att.fileName)
+            }
 
             let inv = Invoice(
-                amount: ocr.amount ?? fileParsed.amount ?? 0,
+                amount: ocr.amount ?? 0,
                 date: ocr.date ?? att.date ?? Date(),
-                vendor: ocr.vendor ?? fileParsed.vendor ?? base,
+                vendor: OCRService.isGenericName(vendor) ? "待填写商家" : vendor,
                 kind: .transport,
                 status: .pending,
-                notes: att.subject.isEmpty ? base : att.subject,
+                notes: att.subject.isEmpty ? att.fileName : att.subject,
                 imageData: att.data,
                 fileName: att.fileName,
                 ocrText: ocr.fullText,
@@ -281,7 +299,6 @@ struct EmailImportView: View {
         }
         try? modelContext.save()
         isLoading = false
-        statusText = "已导入 \(count) 张"
         dismiss()
     }
 }
