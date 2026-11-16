@@ -14,6 +14,7 @@ struct ContentView: View {
     @Query(sort: \ExpenseBatch.createdAt, order: .reverse) private var batches: [ExpenseBatch]
 
     @State private var showAdd = false
+    @State private var showEmailImport = false
     @State private var searchText = ""
     @State private var filterStatus: InvoiceStatus?
     @State private var filterKind: InvoiceKind?
@@ -64,10 +65,11 @@ struct ContentView: View {
                     ContentUnavailableView {
                         Label("还没有发票", systemImage: "doc.text")
                     } description: {
-                        Text("支持拍照、相册、PDF；也可在其它 App 里用「分享」导入。")
+                        Text("支持拍照、相册、PDF，或从邮箱 IMAP 拉取附件。")
                     } actions: {
                         Button("添加发票") { showAdd = true }
                             .buttonStyle(.borderedProminent)
+                        Button("从邮箱导入") { showEmailImport = true }
                     }
                 } else {
                     List {
@@ -99,13 +101,13 @@ struct ContentView: View {
                         }
                     }
                     .listStyle(.insetGrouped)
-                    .environment(\.editMode, .constant(isSelecting ? .active : .inactive))
                 }
             }
             .navigationTitle("发票台账")
             .searchable(text: $searchText, prompt: "搜索商家、金额、状态")
             .toolbar { toolbarContent }
             .sheet(isPresented: $showAdd) { AddInvoiceView() }
+            .sheet(isPresented: $showEmailImport) { EmailImportView() }
             .sheet(item: $sharePayload) { ActivityView(activityItems: $0.urls) }
             .sheet(isPresented: $showBatches) { BatchListView() }
             .fileImporter(isPresented: $showRestore, allowedContentTypes: [.json], allowsMultipleSelection: false) { restore($0) }
@@ -132,8 +134,6 @@ struct ContentView: View {
             }
         }
     }
-
-    // MARK: - Rows
 
     @ViewBuilder
     private func invoiceRow(_ inv: Invoice) -> some View {
@@ -169,8 +169,6 @@ struct ContentView: View {
             }
         }
     }
-
-    // MARK: - Sections
 
     private var statsSection: some View {
         Section("统计（当前筛选）") {
@@ -221,17 +219,12 @@ struct ContentView: View {
 
     private var batchEntrySection: some View {
         Section("报销批次") {
-            Button {
-                showBatches = true
-            } label: {
+            Button { showBatches = true } label: {
                 HStack {
                     Label("查看全部批次", systemImage: "folder")
                     Spacer()
-                    Text("\(batches.count)")
-                        .foregroundStyle(.secondary)
-                    Image(systemName: "chevron.right")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
+                    Text("\(batches.count)").foregroundStyle(.secondary)
+                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
                 }
             }
         }
@@ -249,8 +242,6 @@ struct ContentView: View {
         .buttonStyle(.plain)
     }
 
-    // MARK: - Toolbar
-
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItem(placement: .topBarLeading) {
@@ -261,6 +252,10 @@ struct ContentView: View {
                 }
             } else {
                 Menu {
+                    Button { showEmailImport = true } label: {
+                        Label("从邮箱导入", systemImage: "envelope.badge")
+                    }
+                    Divider()
                     Button { exportCSV() } label: { Label("导出 Excel (CSV)", systemImage: "tablecells") }
                     Button { exportAttachments() } label: { Label("导出附件", systemImage: "doc.on.doc") }
                     Button { exportFinancePackage() } label: { Label("打包给财务", systemImage: "briefcase") }
@@ -268,7 +263,7 @@ struct ContentView: View {
                     Button { exportBackup() } label: { Label("备份全部数据", systemImage: "externaldrive") }
                     Button { showRestore = true } label: { Label("从备份恢复", systemImage: "arrow.clockwise") }
                 } label: {
-                    Image(systemName: "square.and.arrow.up")
+                    Image(systemName: "ellipsis.circle")
                 }
             }
         }
@@ -291,9 +286,7 @@ struct ContentView: View {
                 }
                 .disabled(selectedIds.isEmpty)
             } else {
-                Button {
-                    isSelecting = true
-                } label: {
+                Button { isSelecting = true } label: {
                     Image(systemName: "checkmark.circle")
                 }
                 Button { showAdd = true } label: {
@@ -303,12 +296,8 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Batch actions
-
     private func batchSetStatus(_ status: InvoiceStatus) {
-        for inv in selectedInvoices {
-            inv.statusRaw = status.rawValue
-        }
+        for inv in selectedInvoices { inv.statusRaw = status.rawValue }
         try? modelContext.save()
         showToast("已将 \(selectedIds.count) 张标为「\(status.rawValue)」")
         isSelecting = false
@@ -316,9 +305,7 @@ struct ContentView: View {
     }
 
     private func batchDelete() {
-        for inv in selectedInvoices {
-            modelContext.delete(inv)
-        }
+        for inv in selectedInvoices { modelContext.delete(inv) }
         try? modelContext.save()
         showToast("已删除 \(selectedIds.count) 张")
         isSelecting = false
@@ -347,8 +334,6 @@ struct ContentView: View {
         selectedIds.removeAll()
         batchName = ""
     }
-
-    // MARK: - Export
 
     private func exportCSV() {
         guard let url = ExportService.makeCSV(invoices: filtered),
@@ -428,9 +413,7 @@ struct InvoiceRow: View {
                         .background(statusColor.opacity(0.2), in: Capsule())
                         .foregroundStyle(statusColor)
                     if invoice.batch != nil {
-                        Image(systemName: "folder.fill")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
+                        Image(systemName: "folder.fill").font(.caption2).foregroundStyle(.secondary)
                     }
                     Text(invoice.date, format: .dateTime.month().day())
                         .font(.caption).foregroundStyle(.secondary)

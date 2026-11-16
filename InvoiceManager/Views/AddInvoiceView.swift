@@ -18,6 +18,7 @@ struct AddInvoiceView: View {
     @State private var ocrText: String = ""
     @State private var showCamera = false
     @State private var showDocPicker = false
+    @State private var showEmailImport = false
     @State private var importSource = "manual"
     @State private var isOCR = false
     @State private var statusMsg: String?
@@ -68,6 +69,9 @@ struct AddInvoiceView: View {
                     }
                     Button { showDocPicker = true } label: {
                         Label("文件（PDF/图片，可多选）", systemImage: "folder")
+                    }
+                    Button { showEmailImport = true } label: {
+                        Label("从邮箱导入", systemImage: "envelope.badge")
                     }
 
                     if imageData != nil {
@@ -130,6 +134,9 @@ struct AddInvoiceView: View {
                 }
                 .ignoresSafeArea()
             }
+            .sheet(isPresented: $showEmailImport) {
+                EmailImportView()
+            }
         }
     }
 
@@ -179,7 +186,6 @@ struct AddInvoiceView: View {
             return
         }
 
-        // 多选：每张 OCR 后直接入库
         var saved = 0
         for url in urls {
             let access = url.startAccessingSecurityScopedResource()
@@ -189,12 +195,10 @@ struct AddInvoiceView: View {
             let name = url.lastPathComponent
             let fileParsed = OCRService.parseFileName(base)
             let ocr = await OCRService.recognize(from: data)
-            let amount = ocr.amount ?? fileParsed.amount ?? 0
-            let vendorName = ocr.vendor ?? fileParsed.vendor ?? base
             let inv = Invoice(
-                amount: amount,
+                amount: ocr.amount ?? fileParsed.amount ?? 0,
                 date: ocr.date ?? date,
-                vendor: vendorName,
+                vendor: ocr.vendor ?? fileParsed.vendor ?? base,
                 kind: .transport,
                 status: .pending,
                 notes: base,
@@ -222,17 +226,10 @@ struct AddInvoiceView: View {
         let result = await OCRService.recognize(from: imageData)
         await MainActor.run {
             isOCR = false
-            ocrText = result.fullText
-            if let a = result.amount {
-                amountText = String(format: "%.2f", a)
-            }
-            if let v = result.vendor, vendor.isEmpty {
-                vendor = v
-            }
-            if let d = result.date {
-                date = d
-            }
-            // 文件名兜底金额
+ocrText = result.fullText
+            if let a = result.amount { amountText = String(format: "%.2f", a) }
+            if let v = result.vendor, vendor.isEmpty { vendor = v }
+            if let d = result.date { date = d }
             if amountText.isEmpty, let fn = fileName {
                 let p = OCRService.parseFileName(fn)
                 if let a = p.amount { amountText = String(format: "%.2f", a) }
