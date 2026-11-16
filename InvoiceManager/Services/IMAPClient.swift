@@ -1,7 +1,8 @@
 import Foundation
 import Network
 
-struct EmailAttachment {
+struct EmailAttachment: Identifiable {
+    let id = UUID()
     var fileName: String
     var data: Data
     var subject: String
@@ -13,112 +14,152 @@ enum IMAPError: LocalizedError {
     case loginFailed(String)
     case commandFailed(String)
     case timeout
-    case parseFailed
+    case cancelled
 
     var errorDescription: String? {
         switch self {
         case .connectionFailed(let s): return "连接失败：\(s)"
-        case .loginFailed(let s): return "登录失败：\(s)"
-        case .commandFailed(let s): return "命令失败：\(s)"
-        case .timeout: return "连接超时"
-        case .parseFailed: return "解析邮件失败"
+        case .loginFailed(let s): return "登录失败：\(s)\n请确认已开启 IMAP，并使用授权码（不是登录密码）"
+        case .commandFailed(let s): return s
+        case .timeout: return "连接超时，请检查网络或服务器地址"
+        case .cancelled: return "已取消"
         }
     }
 }
 
-/// 精简 IMAP 客户端：登录 → 搜最近邮件 → 拉 PDF/图片附件
-actor IMAPClient {
+/// 精简、防崩溃的 IMAP 客户端
+final class IMAPClient: @unchecked Sendable {
     private let host: String
     private let port: UInt16
+
+    private let queue = DispatchQueue(label: "imap.client")
     private var connection: NWConnection?
     private var buffer = Data()
+    private let bufferLock = NSLock()
     private var tagCounter = 0
+    private var closed = false
 
     init(host: String, port: Int) {
         self.host = host
-        self.port = UInt16(port)
+        self.port = UInt16(clamping: port)
     }
 
     func fetchInvoiceAttachments(
         email: String,
         password: String,
-        limit: Int = 30
+        limit: Int = 25
     ) async throws -> [EmailAttachment] {
-        try await connect()
-        try await expectGreeting()
+        try await connect(timeout: 20)
+        defer { close() }
+
+        try await waitForGreeting(timeout: 15)
         try await login(email: email, password: password)
         try await selectInbox()
+
         let uids = try await searchRecent(limit: limit)
         var results: [EmailAttachment] = []
 
         for uid in uids {
-            if let atts = try? await fetchAttachments(uid: uid) {
+            if results.count >= 30 { break }
+            do {
+                let atts = try await fetchMessageAttachments(uid: uid)
                 results.append(contentsOf: atts)
+            } catch {
+                // 单封失败跳过，不崩
+                continue
             }
-            if results.count >= 40 { break }
         }
-
-        try? await logout()
-        connection?.cancel()
-        connection = nil
         return results
     }
 
     // MARK: - Connection
 
-    private func connect() async throws {
-        let params = NWParameters.tls
+    private func connect(timeout: TimeInterval) async throws {
+        closed = false
+        bufferLock.lock(); buffer.removeAll(); bufferLock.unlock()
+
+        let tls = NWProtocolTLS.Options()
+        let params = NWParameters(tls: tls, tcp: NWProtocolTCP.Options())
+        params.expiredDNSBehavior = .allow
+
         let conn = NWConnection(
             host: NWEndpoint.Host(host),
-            port: NWEndpoint.Port(rawValue: port)!,
+            port: NWEndpoint.Port(rawValue: port) ?? 993,
             using: params
         )
         self.connection = conn
 
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            let once = OnceFlag()
+            let timer = DispatchSource.makeTimerSource(queue: queue)
+            timer.schedule(deadline: .now() + timeout)
+            timer.setEventHandler {
+                if once.mark() {
+                    conn.cancel()
+                    cont.resume(throwing: IMAPError.timeout)
+                }
+            }
+            timer.resume()
+
             conn.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
-                    cont.resume()
-                case .failed(let e):
-                    cont.resume(throwing: IMAPError.connectionFailed(e.localizedDescription))
+                    if once.mark() {
+                        timer.cancel()
+                        cont.resume()
+                    }
+                case .failed(let err):
+                    if once.mark() {
+                        timer.cancel()
+                        cont.resume(throwing: IMAPError.connectionFailed(err.localizedDescription))
+                    }
                 case .cancelled:
-                    cont.resume(throwing: IMAPError.connectionFailed("已取消"))
+                    if once.mark() {
+                        timer.cancel()
+                        cont.resume(throwing: IMAPError.cancelled)
+                    }
                 default:
                     break
                 }
             }
-            conn.start(queue: .global())
+            conn.start(queue: self.queue)
+            self.startReceive(conn)
         }
-        startReceiveLoop()
     }
 
-    private func startReceiveLoop() {
-        guard let connection else { return }
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 1024 * 1024) { [weak self] data, _, isComplete, error in
-            Task {
-                guard let self else { return }
-                if let data, !data.isEmpty {
-                    await self.appendBuffer(data)
+    private func startReceive(_ conn: NWConnection) {
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 512 * 1024) { [weak self] data, _, isComplete, error in
+            guard let self, !self.closed else { return }
+            if let data, !data.isEmpty {
+                self.bufferLock.lock()
+                // 防止内存暴涨
+                if self.buffer.count < 8 * 1024 * 1024 {
+                    self.buffer.append(data)
                 }
-                if error == nil && !isComplete {
-                    await self.startReceiveLoop()
-                }
+                self.bufferLock.unlock()
+            }
+            if error == nil && !isComplete && !self.closed {
+                self.startReceive(conn)
             }
         }
     }
 
-    private func appendBuffer(_ data: Data) {
-        buffer.append(data)
+    private func close() {
+        closed = true
+        connection?.cancel()
+        connection = nil
+        bufferLock.lock(); buffer.removeAll(); bufferLock.unlock()
     }
+
+    // MARK: - Protocol helpers
 
     private func nextTag() -> String {
         tagCounter += 1
         return "A\(tagCounter)"
     }
 
-    private func send(_ line: String) async throws {
-        guard let connection else { throw IMAPError.connectionFailed("未连接") }
+    private func sendLine(_ line: String) async throws {
+        guard let connection, !closed else { throw IMAPError.connectionFailed("未连接") }
         let payload = Data((line + "\r\n").utf8)
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             connection.send(content: payload, completion: .contentProcessed { error in
@@ -131,152 +172,316 @@ actor IMAPClient {
         }
     }
 
-    private func readUntilTag(_ tag: String, timeoutSeconds: TimeInterval = 30) async throws -> String {
-        let deadline = Date().addingTimeInterval(timeoutSeconds)
+    private func waitForGreeting(timeout: TimeInterval) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if let text = String(data: buffer, encoding: .utf8) ?? String(data: buffer, encoding: .isoLatin1) {
-                let lines = text.components(separatedBy: "\r\n")
-                if let idx = lines.firstIndex(where: { $0.hasPrefix("\(tag) ") }) {
-                    let collected = lines[0...idx].joined(separator: "\r\n")
-                    // 消费掉已读部分
-                    if let range = text.range(of: collected) {
-                        let rest = String(text[range.upperBound...])
-                        buffer = Data(rest.utf8)
-                    } else {
-                        buffer.removeAll()
-                    }
-                    return collected
-                }
+            let text = currentText()
+            if text.contains("* OK") || text.uppercased().contains("IMAP") {
+                return
             }
-            try await Task.sleep(nanoseconds: 50_000_000)
+            try await Task.sleep(nanoseconds: 40_000_000)
+        }
+        throw IMAPError.connectionFailed("服务器无响应（问候超时）")
+    }
+
+    private func runCommand(_ command: String, timeout: TimeInterval = 25) async throws -> String {
+        let tag = nextTag()
+        // 清空旧缓冲里已完成的残留（保留未完成数据太危险，简单清空）
+        // 注意：不能清空，否则吞掉未读数据；只发命令再等到 tag
+        try await sendLine("\(tag) \(command)")
+        return try await readUntilTagged(tag, timeout: timeout)
+    }
+
+    private func readUntilTagged(_ tag: String, timeout: TimeInterval) async throws -> String {
+        let deadline = Date().addingTimeInterval(timeout)
+        let okPrefix = "\(tag) OK"
+        let noPrefix = "\(tag) NO"
+        let badPrefix = "\(tag) BAD"
+
+        while Date() < deadline {
+            bufferLock.lock()
+            let snapshot = buffer
+            bufferLock.unlock()
+
+            // 用 latin1 保留字节
+            let text = String(data: snapshot, encoding: .isoLatin1) ?? ""
+
+            if let range = text.range(of: "\r\n\(okPrefix)")
+                ?? text.range(of: "\n\(okPrefix)")
+                ?? text.range(of: okPrefix) {
+                // 找到标签行结尾
+                let fromStart = text[..<range.upperBound]
+                var endIdx = range.upperBound
+                if let lineEnd = text.range(of: "\r\n", range: endIdx..<text.endIndex) {
+                    endIdx = lineEnd.upperBound
+                } else if let lineEnd = text.range(of: "\n", range: endIdx..<text.endIndex) {
+                    endIdx = lineEnd.upperBound
+                }
+                let collected = String(text[..<endIdx])
+                // 消费
+                let consumed = collected.data(using: .isoLatin1)?.count ?? 0
+                bufferLock.lock()
+                if buffer.count >= consumed {
+                    buffer.removeFirst(consumed)
+                } else {
+                    buffer.removeAll()
+                }
+                bufferLock.unlock()
+                return collected
+            }
+
+            if text.contains(noPrefix) || text.contains(badPrefix) {
+                // 取最后几行当错误信息
+                let lines = text.components(separatedBy: "\r\n").filter { !$0.isEmpty }
+                let msg = lines.suffix(3).joined(separator: " | ")
+                bufferLock.lock(); buffer.removeAll(); bufferLock.unlock()
+                throw IMAPError.commandFailed(msg)
+            }
+
+            try await Task.sleep(nanoseconds: 40_000_000)
         }
         throw IMAPError.timeout
     }
 
-    private func expectGreeting() async throws {
-        let deadline = Date().addingTimeInterval(15)
-        while Date() < deadline {
-            if let text = String(data: buffer, encoding: .utf8),
-               text.contains("* OK") || text.lowercased().contains("imap") {
-                return
-            }
-            try await Task.sleep(nanoseconds: 50_000_000)
-        }
-        throw IMAPError.connectionFailed("未收到服务器问候")
+    private func currentText() -> String {
+        bufferLock.lock()
+        let d = buffer
+        bufferLock.unlock()
+        return String(data: d, encoding: .isoLatin1) ?? ""
     }
 
+    // MARK: - Commands
+
     private func login(email: String, password: String) async throws {
-        let tag = nextTag()
-        // 转义密码中的特殊字符
-        let user = quote(email)
-        let pass = quote(password)
-        try await send("\(tag) LOGIN \(user) \(pass)")
-        let resp = try await readUntilTag(tag)
-        if resp.contains("\(tag) OK") { return }
-        throw IMAPError.loginFailed(resp.components(separatedBy: "\r\n").last ?? resp)
+        let user = imapQuote(email)
+        let pass = imapQuote(password)
+        do {
+            _ = try await runCommand("LOGIN \(user) \(pass)", timeout: 20)
+        } catch {
+            if case IMAPError.commandFailed(let msg) = error {
+                throw IMAPError.loginFailed(msg)
+            }
+            throw error
+        }
     }
 
     private func selectInbox() async throws {
-        let tag = nextTag()
-        try await send("\(tag) SELECT INBOX")
-        let resp = try await readUntilTag(tag)
-        guard resp.contains("\(tag) OK") else {
-            throw IMAPError.commandFailed("无法打开收件箱")
-        }
+        _ = try await runCommand("SELECT INBOX", timeout: 15)
     }
 
     private func searchRecent(limit: Int) async throws -> [Int] {
-        // 最近 45 天
         let cal = Calendar.current
         let since = cal.date(byAdding: .day, value: -45, to: Date()) ?? Date()
         let df = DateFormatter()
         df.locale = Locale(identifier: "en_US_POSIX")
-        df.dateFormat = "dd-MMM-yyyy"
         df.timeZone = TimeZone(secondsFromGMT: 0)
+        df.dateFormat = "dd-MMM-yyyy"
         let sinceStr = df.string(from: since)
 
-        let tag = nextTag()
-        try await send("\(tag) UID SEARCH SINCE \(sinceStr)")
-        let resp = try await readUntilTag(tag)
-
-        var uids: [Int] = []
-        for line in resp.components(separatedBy: "\r\n") {
-            if line.hasPrefix("* SEARCH") {
-                let parts = line.split(separator: " ").dropFirst(2)
-                uids = parts.compactMap { Int($0) }
-            }
+        let resp: String
+        do {
+            resp = try await runCommand("UID SEARCH SINCE \(sinceStr)", timeout: 30)
+        } catch {
+            // 部分服务器不支持 SINCE，退回 ALL 再截断
+            let all = try await runCommand("UID SEARCH ALL", timeout: 30)
+            return parseSearchUIDs(all).suffix(limit).reversed()
         }
-        // 取最新的 limit 封
+        let uids = parseSearchUIDs(resp)
         return Array(uids.suffix(limit).reversed())
     }
 
-    private func fetchAttachments(uid: Int) async throws -> [EmailAttachment] {
-        let tag = nextTag()
-        try await send("\(tag) UID FETCH \(uid) (BODY.PEEK[] BODY.PEEK[HEADER.FIELDS (SUBJECT DATE)])")
-        let resp = try await readUntilTag(tag, timeoutSeconds: 60)
-
-        // 提取 literal 正文
-        guard let body = extractLiteral(from: resp) else { return [] }
-
-        let subject = parseHeaderField(resp, name: "Subject") ?? parseHeaderField(String(data: body, encoding: .utf8) ?? "", name: "Subject") ?? ""
-        let date = parseDate(from: resp) ?? parseDate(from: String(data: body, encoding: .utf8) ?? "")
-
-        return parseMIMEAttachments(data: body, subject: subject, date: date)
-    }
-
-    private func logout() async throws {
-        let tag = nextTag()
-        try await send("\(tag) LOGOUT")
-        _ = try? await readUntilTag(tag, timeoutSeconds: 5)
-    }
-
-    // MARK: - MIME / helpers
-
-    private func quote(_ s: String) -> String {
-        "\"" + s.replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"") + "\""
-    }
-
-    private func extractLiteral(from response: String) -> Data? {
-        // 找 {size}\r\n 形式的 IMAP literal
-        guard let open = response.range(of: "{"),
-              let close = response.range(of: "}", range: open.upperBound..<response.endIndex) else {
-            return response.data(using: .utf8)
+    private func parseSearchUIDs(_ resp: String) -> [Int] {
+        var uids: [Int] = []
+        for line in resp.components(separatedBy: "\r\n") {
+            if line.uppercased().hasPrefix("* SEARCH") {
+                let parts = line.split(separator: " ").dropFirst(2)
+                uids.append(contentsOf: parts.compactMap { Int($0) })
+            }
         }
-        let sizeStr = response[open.upperBound..<close.lowerBound]
-        guard let size = Int(sizeStr), size > 0 else { return response.data(using: .utf8) }
-
-        let after = response[close.upperBound...]
-        let payload: Substring
-        if after.hasPrefix("\r\n") {
-            payload = after.dropFirst(2)
-        } else if after.hasPrefix("\n") {
-            payload = after.dropFirst()
-        } else {
-            payload = after
-        }
-        let data = Data(payload.utf8)
-        if data.count >= size {
-            return data.prefix(size)
-        }
-        // buffer 可能用了 isoLatin1，回退整段
-        return data
+        return uids
     }
 
-    private func parseHeaderField(_ text: String, name: String) -> String? {
-        let lines = text.components(separatedBy: CharacterSet.newlines)
-        let prefix = name.lowercased() + ":"
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.lowercased().hasPrefix(prefix) {
-                return trimmed.dropFirst(prefix.count).trimmingCharacters(in: .whitespaces)
+    private func fetchMessageAttachments(uid: Int) async throws -> [EmailAttachment] {
+        // 先拉头，缩小范围
+        let headerResp = try await runCommand(
+            "UID FETCH \(uid) (BODY.PEEK[HEADER.FIELDS (SUBJECT DATE CONTENT-TYPE)])",
+            timeout: 20
+        )
+        let subject = headerField(headerResp, "Subject") ?? ""
+        let date = parseEmailDate(headerField(headerResp, "Date"))
+
+        // 拉全文（限制超时，单封过大则跳过）
+        let full: String
+        do {
+            full = try await runCommand("UID FETCH \(uid) BODY.PEEK[]", timeout: 45)
+        } catch {
+            return []
+        }
+
+        guard let literal = extractLargestLiteral(from: full) else { return [] }
+        return parseAttachments(from: literal, subject: subject, date: date)
+    }
+
+    // MARK: - MIME
+
+    private func extractLargestLiteral(from response: String) -> Data? {
+        // 找所有 {size} 并取最大的那块
+        var best: Data?
+        var bestSize = 0
+        var search = response.startIndex
+
+        while search < response.endIndex {
+            guard let open = response.range(of: "{", range: search..<response.endIndex),
+                  let close = response.range(of: "}", range: open.upperBound..<response.endIndex) else {
+                break
+            }
+            let sizeStr = response[open.upperBound..<close.lowerBound]
+                .trimmingCharacters(in: .whitespaces)
+            // 可能带 + 号
+            let cleaned = sizeStr.replacingOccurrences(of: "+", with: "")
+            guard let size = Int(cleaned), size > 50 else {
+                search = close.upperBound
+                continue
+            }
+
+            var payloadStart = close.upperBound
+            if response[payloadStart...].hasPrefix("\r\n") {
+                payloadStart = response.index(payloadStart, offsetBy: 2)
+            } else if response[payloadStart...].hasPrefix("\n") {
+                payloadStart = response.index(payloadStart, offsetBy: 1)
+            }
+
+            let raw = String(response[payloadStart...])
+            guard let data = raw.data(using: .isoLatin1) else {
+                search = close.upperBound
+                continue
+            }
+            let slice = data.prefix(size)
+            if slice.count > bestSize {
+                bestSize = slice.count
+                best = Data(slice)
+            }
+            search = close.upperBound
+        }
+        return best
+    }
+
+    private func parseAttachments(from data: Data, subject: String, date: Date?) -> [EmailAttachment] {
+        // 整封就是 PDF
+        if isPDF(data) {
+            return [EmailAttachment(fileName: "invoice.pdf", data: data, subject: subject, date: date)]
+        }
+
+        guard let text = String(data: data, encoding: .isoLatin1) else { return [] }
+
+        guard let boundary = findBoundary(in: text) else {
+            // 非 multipart，尝试当图片
+            if isJPEG(data) || isPNG(data) {
+                return [EmailAttachment(fileName: "invoice.jpg", data: data, subject: subject, date: date)]
+            }
+            return []
+        }
+
+        var result: [EmailAttachment] = []
+        let parts = text.components(separatedBy: "--\(boundary)")
+
+        for part in parts {
+            if part.count < 80 { continue }
+            let lower = part.lowercased()
+
+            let looksPDF = lower.contains("application/pdf")
+                || lower.contains(".pdf")
+            let looksImg = lower.contains("image/jpeg")
+                || lower.contains("image/png")
+                || lower.contains("image/jpg")
+                || lower.contains(".jpg")
+                || lower.contains(".jpeg")
+                || lower.contains(".png")
+
+            guard looksPDF || looksImg else { continue }
+
+            let fileName = extractFileName(part) ?? (looksPDF ? "invoice.pdf" : "invoice.jpg")
+
+            guard let headerEnd = part.range(of: "\r\n\r\n") ?? part.range(of: "\n\n") else { continue }
+            var body = String(part[headerEnd.upperBound...])
+            if let endMark = body.range(of: "\r\n--") {
+                body = String(body[..<endMark.lowerBound])
+            }
+            body = body.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            let payload: Data?
+            if lower.contains("content-transfer-encoding: base64") {
+                let cleaned = body.components(separatedBy: CharacterSet.whitespacesAndNewlines).joined()
+                payload = Data(base64Encoded: cleaned, options: .ignoreUnknownCharacters)
+            } else if lower.contains("quoted-printable") {
+                payload = decodeQP(body)
+            } else {
+                payload = body.data(using: .isoLatin1)
+            }
+
+            guard var bytes = payload, bytes.count >= 800 else { continue }
+            // 截掉可能的尾部垃圾
+            if looksPDF, let range = bytes.range(of: Data([0x25, 0x25, 0x45, 0x4F, 0x46])) { // %%EOF
+                bytes = bytes.prefix(upTo: range.upperBound)
+            }
+            result.append(EmailAttachment(fileName: fileName, data: bytes, subject: subject, date: date))
+        }
+        return result
+    }
+
+    private func findBoundary(in text: String) -> String? {
+        let lower = text.lowercased()
+        guard let r = lower.range(of: "boundary=") else { return nil }
+        // 在原文对应位置截
+        let origin = text.index(text.startIndex, offsetBy: lower.distance(from: lower.startIndex, to: r.upperBound))
+        var rest = String(text[origin...])
+        rest = rest.trimmingCharacters(in: .whitespaces)
+        if rest.hasPrefix("\"") {
+            rest = String(rest.dropFirst())
+            if let end = rest.firstIndex(of: "\"") {
+                return String(rest[..<end])
+            }
+        }
+        let cut = rest.prefix(while: { !$0.isWhitespace && $0 != ";" && $0 != "\r" && $0 != "\n" })
+        let b = String(cut).trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+        return b.isEmpty ? nil : b
+    }
+
+    private func extractFileName(_ part: String) -> String? {
+        let patterns = [
+            #"filename\*=UTF-8''([^\s;]+)"#,
+            #"filename="([^"]+)""#,
+            #"filename=([^\s;]+)"#,
+            #"name="([^"]+)""#
+        ]
+        for p in patterns {
+            guard let re = try? NSRegularExpression(pattern: p, options: .caseInsensitive) else { continue }
+            let range = NSRange(part.startIndex..., in: part)
+            if let m = re.firstMatch(in: part, range: range),
+               let r = Range(m.range(at: 1), in: part) {
+                var name = String(part[r])
+                name = name.removingPercentEncoding ?? name
+                return name.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
             }
         }
         return nil
     }
 
-    private func parseDate(from text: String) -> Date? {
-        guard let raw = parseHeaderField(text, name: "Date") else { return nil }
+    private func headerField(_ text: String, _ name: String) -> String? {
+        let lines = text.components(separatedBy: CharacterSet.newlines)
+        let key = name.lowercased() + ":"
+        for line in lines {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            if t.lowercased().hasPrefix(key) {
+                return t.dropFirst(key.count).trimmingCharacters(in: .whitespaces)
+            }
+        }
+        return nil
+    }
+
+    private func parseEmailDate(_ raw: String?) -> Date? {
+        guard var raw else { return nil }
+        raw = raw.trimmingCharacters(in: .whitespaces)
         let formats = [
             "EEE, dd MMM yyyy HH:mm:ss Z",
             "dd MMM yyyy HH:mm:ss Z",
@@ -291,123 +496,55 @@ actor IMAPClient {
         return nil
     }
 
-    private func parseMIMEAttachments(data: Data, subject: String, date: Date?) -> [EmailAttachment] {
-        guard let text = String(data: data, encoding: .utf8)
-                ?? String(data: data, encoding: .isoLatin1) else { return [] }
-
-        // 找 boundary
-        guard let boundaryLine = text.split(whereSeparator: \.isNewline)
-            .map(String.init)
-            .first(where: { $0.lowercased().contains("boundary=") }) else {
-            // 可能是整封就是 PDF
-            if isPDF(data) {
-                return [EmailAttachment(fileName: "invoice.pdf", data: data, subject: subject, date: date)]
-            }
-            return []
-        }
-
-        var boundary = ""
-        if let range = boundaryLine.range(of: "boundary=", options: .caseInsensitive) {
-            var b = String(boundaryLine[range.upperBound...])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            b = b.trimmingCharacters(in: CharacterSet(charactersIn: "\"';"))
-            boundary = b
-        }
-        guard !boundary.isEmpty else { return [] }
-
-        let parts = text.components(separatedBy: "--\(boundary)")
-        var result: [EmailAttachment] = []
-
-        for part in parts {
-            let lower = part.lowercased()
-            let isPDF = lower.contains("application/pdf") || lower.contains("filename=\".pdf") || lower.contains("filename=.pdf") || lower.contains("name=\".pdf")
-            let isImage = lower.contains("image/jpeg") || lower.contains("image/png") || lower.contains("image/jpg")
-                || lower.contains(".jpg") || lower.contains(".jpeg") || lower.contains(".png")
-
-            guard isPDF || isImage else { continue }
-
-            let fileName = extractFileName(from: part) ?? (isPDF ? "invoice.pdf" : "invoice.jpg")
-
-            // 正文在空行后
-            guard let sep = part.range(of: "\r\n\r\n") ?? part.range(of: "\n\n") else { continue }
-            var bodyStr = String(part[sep.upperBound...])
-            // 去掉结尾 boundary 残留
-            if let end = bodyStr.range(of: "\r\n--") {
-                bodyStr = String(bodyStr[..<end.lowerBound])
-            }
-            bodyStr = bodyStr.trimmingCharacters(in: .whitespacesAndNewlines)
-
-            let encoding: String
-            if lower.contains("content-transfer-encoding: base64") {
-                encoding = "base64"
-            } else if lower.contains("content-transfer-encoding: quoted-printable") {
-                encoding = "qp"
-            } else {
-                encoding = "binary"
-            }
-
-            let payload: Data?
-            switch encoding {
-            case "base64":
-                let cleaned = bodyStr.components(separatedBy: CharacterSet.whitespacesAndNewlines).joined()
-                payload = Data(base64Encoded: cleaned)
-            case "qp":
-                payload = decodeQuotedPrintable(bodyStr)
-            default:
-                payload = bodyStr.data(using: .isoLatin1)
-            }
-
-            guard let payload, !payload.isEmpty else { continue }
-            // 只要像发票的：pdf 或图片，且不要太小
-            if payload.count < 800 { continue }
-            result.append(EmailAttachment(fileName: fileName, data: payload, subject: subject, date: date))
-        }
-        return result
+    private func imapQuote(_ s: String) -> String {
+        "\"" + s
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"") + "\""
     }
 
-    private func extractFileName(from part: String) -> String? {
-        let patterns = [
-            #"filename\*=UTF-8''([^;\s]+)"#,
-            #"filename="([^"]+)""#,
-            #"filename=([^;\s]+)"#,
-            #"name="([^"]+)""#
-        ]
-        for p in patterns {
-            if let re = try? NSRegularExpression(pattern: p, options: .caseInsensitive),
-               let m = re.firstMatch(in: part, range: NSRange(part.startIndex..., in: part)),
-               let r = Range(m.range(at: 1), in: part) {
-                var name = String(part[r])
-                name = name.removingPercentEncoding ?? name
-                return name.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-            }
-        }
-        return nil
-    }
-
-    private func decodeQuotedPrintable(_ s: String) -> Data? {
+    private func decodeQP(_ s: String) -> Data? {
         var out = Data()
-        let chars = Array(s.utf8)
+        let bytes = Array(s.utf8)
         var i = 0
-        while i < chars.count {
-            if chars[i] == 61, i + 2 < chars.count { // '='
-                let hex = String(bytes: [chars[i+1], chars[i+2]], encoding: .ascii) ?? ""
-                if let byte = UInt8(hex, radix: 16) {
-                    out.append(byte)
+        while i < bytes.count {
+            if bytes[i] == 61, i + 2 < bytes.count {
+                let hex = String(bytes: [bytes[i+1], bytes[i+2]], encoding: .ascii) ?? ""
+                if let b = UInt8(hex, radix: 16) {
+                    out.append(b)
                     i += 3
                     continue
                 }
             }
-            if chars[i] == 13 || chars[i] == 10 {
+            if bytes[i] == 13 || bytes[i] == 10 {
                 i += 1
                 continue
             }
-            out.append(chars[i])
+            out.append(bytes[i])
             i += 1
         }
         return out
     }
 
-    private func isPDF(_ data: Data) -> Bool {
-        data.count > 4 && data[0] == 0x25 && data[1] == 0x50
+    private func isPDF(_ d: Data) -> Bool {
+        d.count > 4 && d[0] == 0x25 && d[1] == 0x50 && d[2] == 0x44 && d[3] == 0x46
+    }
+    private func isJPEG(_ d: Data) -> Bool {
+        d.count > 2 && d[0] == 0xFF && d[1] == 0xD8
+    }
+    private func isPNG(_ d: Data) -> Bool {
+        d.count > 4 && d[0] == 0x89 && d[1] == 0x50
+    }
+}
+
+/// 保证 continuation 只 resume 一次
+private final class OnceFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false
+    func mark() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if done { return false }
+        done = true
+        return true
     }
 }

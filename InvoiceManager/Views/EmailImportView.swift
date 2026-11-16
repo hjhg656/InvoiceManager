@@ -15,35 +15,34 @@ struct EmailImportView: View {
     @State private var statusText = ""
     @State private var errorText: String?
     @State private var attachments: [EmailAttachment] = []
-    @State private var selected: Set<Int> = []
+    @State private var selected: Set<UUID> = []
     @State private var phase: Phase = .login
+    @State private var fetchTask: Task<Void, Never>?
 
-    enum Phase {
-        case login, results
-    }
+    enum Phase { case login, results }
 
     var body: some View {
         NavigationStack {
             Group {
                 switch phase {
-                case .login:
-                    loginForm
-                case .results:
-                    resultsList
+                case .login: loginForm
+                case .results: resultsList
                 }
             }
             .navigationTitle("邮箱导入")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("关闭") { dismiss() }
+                    Button("关闭") {
+                        fetchTask?.cancel()
+                        dismiss()
+                    }
                 }
             }
             .onAppear(perform: restoreAccount)
+            .onDisappear { fetchTask?.cancel() }
         }
     }
-
-    // MARK: - Login
 
     private var loginForm: some View {
         Form {
@@ -67,7 +66,7 @@ struct EmailImportView: View {
                     .textInputAutocapitalization(.never)
                     .keyboardType(.emailAddress)
                     .autocorrectionDisabled()
-                SecureField("密码 / 授权码", text: $password)
+                SecureField("授权码（不是登录密码）", text: $password)
             }
 
             Section("服务器") {
@@ -80,12 +79,12 @@ struct EmailImportView: View {
 
             Section {
                 Button {
-                    Task { await fetch() }
+                    startFetch()
                 } label: {
                     if isLoading {
                         HStack {
                             ProgressView()
-                            Text("正在连接邮箱…")
+                            Text(statusText.isEmpty ? "连接中…" : statusText)
                         }
                     } else {
                         Text("拉取最近发票附件")
@@ -93,6 +92,15 @@ struct EmailImportView: View {
                     }
                 }
                 .disabled(isLoading || email.isEmpty || password.isEmpty || host.isEmpty)
+
+                if isLoading {
+                    Button("取消", role: .destructive) {
+                        fetchTask?.cancel()
+                        isLoading = false
+                        statusText = ""
+                        errorText = "已取消"
+                    }
+                }
             }
 
             if let errorText {
@@ -104,14 +112,12 @@ struct EmailImportView: View {
             }
 
             Section("说明") {
-                Text("多数邮箱需使用「授权码 / 应用专用密码」，不是登录密码。\n\n• QQ：设置 → 账户 → 开启 IMAP → 生成授权码\n• 163：设置 → POP3/SMTP/IMAP → 授权码\n• Gmail：需开启两步验证并生成应用专用密码\n\n将扫描最近 45 天收件箱中的 PDF / 图片附件。")
+                Text("必须使用「授权码 / 应用专用密码」。\n\n• QQ：设置 → 账户 → 开启 IMAP → 生成授权码\n• 163：设置 → IMAP → 授权码\n• Gmail：两步验证 → 应用专用密码\n\n扫描最近 45 天收件箱中的 PDF / 图片附件。")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
         }
     }
-
-    // MARK: - Results
 
     private var resultsList: some View {
         List {
@@ -121,12 +127,11 @@ struct EmailImportView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section("选择要导入的附件（\(selected.count)/\(attachments.count)）") {
-                ForEach(Array(attachments.enumerated()), id: \.offset) { index, att in
+            Section("选择要导入（\(selected.count)/\(attachments.count)）") {
+                ForEach(attachments) { att in
                     HStack(spacing: 12) {
-                        Image(systemName: selected.contains(index) ? "checkmark.circle.fill" : "circle")
-                            .foregroundStyle(selected.contains(index) ? Color.accentColor : .secondary)
-
+                        Image(systemName: selected.contains(att.id) ? "checkmark.circle.fill" : "circle")
+                            .foregroundStyle(selected.contains(att.id) ? Color.accentColor : .secondary)
                         VStack(alignment: .leading, spacing: 4) {
                             Text(att.fileName)
                                 .font(.subheadline.weight(.medium))
@@ -147,8 +152,8 @@ struct EmailImportView: View {
                     }
                     .contentShape(Rectangle())
                     .onTapGesture {
-                        if selected.contains(index) { selected.remove(index) }
-                        else { selected.insert(index) }
+                        if selected.contains(att.id) { selected.remove(att.id) }
+                        else { selected.insert(att.id) }
                     }
                 }
             }
@@ -173,12 +178,11 @@ struct EmailImportView: View {
                     phase = .login
                     attachments = []
                     selected = []
+                    errorText = nil
                 }
             }
         }
     }
-
-    // MARK: - Actions
 
     private func restoreAccount() {
         if let acc = EmailAccountStore.loadAccount() {
@@ -196,36 +200,57 @@ struct EmailImportView: View {
         }
     }
 
-    private func fetch() async {
+    private func startFetch() {
         errorText = nil
         isLoading = true
-        statusText = "连接 \(host)…"
+        statusText = "正在连接 \(host)…"
 
         let portNum = Int(port) ?? 993
         let account = EmailAccount(email: email, host: host, port: portNum, useTLS: true)
         EmailAccountStore.saveAccount(account)
         EmailAccountStore.savePassword(password, account: email)
 
-        let client = IMAPClient(host: host, port: portNum)
-        do {
-            let list = try await client.fetchInvoiceAttachments(
-                email: email,
-                password: password,
-                limit: 40
-            )
-            await MainActor.run {
-                attachments = list
-                selected = Set(list.indices)
-                statusText = list.isEmpty
-                    ? "未找到 PDF/图片附件。可检查是否用了授权码，或换最近有发票的邮箱。"
-                    : "找到 \(list.count) 个附件，请勾选后导入"
-                phase = .results
-                isLoading = false
-            }
-        } catch {
-            await MainActor.run {
-                errorText = error.localizedDescription
-                isLoading = false
+        let hostCopy = host
+        let emailCopy = email
+        let passwordCopy = password
+
+        fetchTask?.cancel()
+        fetchTask = Task {
+            do {
+                try Task.checkCancellation()
+                await MainActor.run { statusText = "已连接，正在登录…" }
+
+                let client = IMAPClient(host: hostCopy, port: portNum)
+                let list = try await client.fetchInvoiceAttachments(
+                    email: emailCopy,
+                    password: passwordCopy,
+                    limit: 25
+                )
+
+                try Task.checkCancellation()
+
+                await MainActor.run {
+                    attachments = list
+                    selected = Set(list.map(\.id))
+                    statusText = list.isEmpty
+                        ? "未找到 PDF/图片附件。请确认授权码正确，且近期邮件里有发票附件。"
+                        : "找到 \(list.count) 个附件，请勾选后导入"
+                    phase = .results
+                    isLoading = false
+                    statusText = statusText
+                }
+            } catch is CancellationError {
+                await MainActor.run {
+                    isLoading = false
+                    statusText = ""
+                    errorText = "已取消"
+                }
+            } catch {
+                await MainActor.run {
+                    isLoading = false
+                    statusText = ""
+                    errorText = error.localizedDescription
+                }
             }
         }
     }
@@ -233,9 +258,8 @@ struct EmailImportView: View {
     private func importSelected() async {
         isLoading = true
         var count = 0
-        for index in selected.sorted() {
-            guard index < attachments.count else { continue }
-            let att = attachments[index]
+        let chosen = attachments.filter { selected.contains($0.id) }
+        for att in chosen {
             let base = (att.fileName as NSString).deletingPathExtension
             let fileParsed = OCRService.parseFileName(base)
             let ocr = await OCRService.recognize(from: att.data)
@@ -256,10 +280,8 @@ struct EmailImportView: View {
             count += 1
         }
         try? modelContext.save()
-        await MainActor.run {
-            isLoading = false
-            statusText = "已导入 \(count) 张发票"
-            dismiss()
-        }
+        isLoading = false
+        statusText = "已导入 \(count) 张"
+        dismiss()
     }
 }
