@@ -85,7 +85,7 @@ struct EmailImportView: View {
                             Text(statusText.isEmpty ? "连接中…" : statusText)
                         }
                     } else {
-                        Text("拉取高德/发票邮件附件")
+                        Text("拉取发票附件")
                             .frame(maxWidth: .infinity)
                     }
                 }
@@ -107,8 +107,8 @@ struct EmailImportView: View {
                 }
             }
 
-            Section("说明") {
-                Text("会优先搜索主题含「发票 / 高德 / 滴滴」的邮件，只导入真实 PDF/图片附件。\n\n高德打车邮件主题一般为「高德打车电子发票」。")
+            Section("规则") {
+                Text("• 只导入「电子发票」PDF\n• 自动跳过「电子行程单」\n• 若是 ZIP 压缩包，会解压并只取其中的发票 PDF\n• 文件名如【富安出行-12.44元】会识别金额和商家")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -123,7 +123,7 @@ struct EmailImportView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section("选择要导入（\(selected.count)/\(attachments.count)）") {
+            Section("电子发票（已排除行程单）\(selected.count)/\(attachments.count)") {
                 ForEach(attachments) { att in
                     HStack(spacing: 12) {
                         Image(systemName: selected.contains(att.id) ? "checkmark.circle.fill" : "circle")
@@ -132,11 +132,15 @@ struct EmailImportView: View {
                             Text(displayTitle(att))
                                 .font(.subheadline.weight(.medium))
                                 .lineLimit(2)
-                            Text(att.subject.isEmpty ? att.fileName : att.subject)
+                            Text(att.fileName)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(2)
                             HStack {
+                                if let amount = OCRService.parseFileName(att.fileName).amount {
+                                    Text(String(format: "¥%.2f", amount))
+                                        .foregroundStyle(.orange)
+                                }
                                 if let d = att.date {
                                     Text(d, format: .dateTime.year().month().day())
                                 }
@@ -181,9 +185,9 @@ struct EmailImportView: View {
     }
 
     private func displayTitle(_ att: EmailAttachment) -> String {
-        if let v = MIMEDecoder.vendorFromSubject(att.subject) { return v }
-        let parsed = OCRService.parseFileName(att.fileName + " " + att.subject)
+        let parsed = OCRService.parseFileName(att.fileName)
         if let v = parsed.vendor, !OCRService.isGenericName(v) { return v }
+        if let v = MIMEDecoder.vendorFromSubject(att.subject) { return v }
         if !att.subject.isEmpty { return att.subject }
         return att.fileName
     }
@@ -221,13 +225,13 @@ struct EmailImportView: View {
         fetchTask = Task {
             do {
                 try Task.checkCancellation()
-                await MainActor.run { statusText = "登录并搜索发票邮件…" }
+                await MainActor.run { statusText = "搜索发票邮件（跳过行程单）…" }
 
                 let client = IMAPClient(host: hostCopy, port: portNum)
                 let list = try await client.fetchInvoiceAttachments(
                     email: emailCopy,
                     password: passwordCopy,
-                    limit: 30
+                    limit: 40
                 )
 
                 try Task.checkCancellation()
@@ -236,8 +240,8 @@ struct EmailImportView: View {
                     attachments = list
                     selected = Set(list.map(\.id))
                     statusText = list.isEmpty
-                        ? "没找到带 PDF 的发票邮件。可在邮件里确认附件是否为 PDF。"
-                        : "找到 \(list.count) 个真实附件（已过滤乱码）"
+                        ? "未找到电子发票 PDF。行程单已自动忽略；若是 RAR 压缩包暂不支持，请用 ZIP 或直接 PDF。"
+                        : "找到 \(list.count) 张电子发票（已排除行程单，ZIP 已解压）"
                     phase = .results
                     isLoading = false
                 }
@@ -268,15 +272,18 @@ struct EmailImportView: View {
                 subject: att.subject
             )
 
+            let fileParsed = OCRService.parseFileName(att.fileName)
             let vendor: String = {
+                if let v = fileParsed.vendor, !OCRService.isGenericName(v) { return v }
                 if let v = MIMEDecoder.vendorFromSubject(att.subject) { return v }
                 if let v = ocr.vendor, !OCRService.isGenericName(v) { return v }
-                if !att.subject.isEmpty { return OCRService.cleanVendor(att.subject) }
                 return "高德打车"
             }()
 
+            let amount = ocr.amount ?? fileParsed.amount ?? 0
+
             let inv = Invoice(
-                amount: ocr.amount ?? 0,
+                amount: amount,
                 date: ocr.date ?? att.date ?? Date(),
                 vendor: vendor,
                 kind: .transport,

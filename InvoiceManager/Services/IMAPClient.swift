@@ -45,7 +45,7 @@ final class IMAPClient: @unchecked Sendable {
     func fetchInvoiceAttachments(
         email: String,
         password: String,
-        limit: Int = 30
+        limit: Int = 40
     ) async throws -> [EmailAttachment] {
         try await connect(timeout: 20)
         defer { close() }
@@ -54,7 +54,6 @@ final class IMAPClient: @unchecked Sendable {
         try await login(email: email, password: password)
         try await selectInbox()
 
-        // 优先搜带「发票」的邮件；失败再退回最近邮件
         var uids = try await searchInvoiceRelated(limit: limit)
         if uids.isEmpty {
             uids = try await searchRecent(limit: limit)
@@ -62,7 +61,7 @@ final class IMAPClient: @unchecked Sendable {
 
         var results: [EmailAttachment] = []
         for uid in uids {
-            if results.count >= 40 { break }
+            if results.count >= 50 { break }
             if let atts = try? await fetchMessageAttachments(uid: uid) {
                 results.append(contentsOf: atts)
             }
@@ -70,7 +69,7 @@ final class IMAPClient: @unchecked Sendable {
         return results
     }
 
-    // MARK: - Connection
+    // MARK: - Connection (same stable pattern)
 
     private func connect(timeout: TimeInterval) async throws {
         closed = false
@@ -124,14 +123,10 @@ final class IMAPClient: @unchecked Sendable {
             guard let self, !self.closed else { return }
             if let data, !data.isEmpty {
                 self.bufferLock.lock()
-                if self.buffer.count < 10 * 1024 * 1024 {
-                    self.buffer.append(data)
-                }
+                if self.buffer.count < 12 * 1024 * 1024 { self.buffer.append(data) }
                 self.bufferLock.unlock()
             }
-            if error == nil && !isComplete && !self.closed {
-                self.startReceive(conn)
-            }
+            if error == nil && !isComplete && !self.closed { self.startReceive(conn) }
         }
     }
 
@@ -209,9 +204,8 @@ final class IMAPClient: @unchecked Sendable {
 
             if text.contains(noPrefix) || text.contains(badPrefix) {
                 let lines = text.components(separatedBy: "\r\n").filter { !$0.isEmpty }
-                let msg = lines.suffix(3).joined(separator: " | ")
                 bufferLock.lock(); buffer.removeAll(); bufferLock.unlock()
-                throw IMAPError.commandFailed(msg)
+                throw IMAPError.commandFailed(lines.suffix(3).joined(separator: " | "))
             }
             try await Task.sleep(nanoseconds: 40_000_000)
         }
@@ -227,9 +221,7 @@ final class IMAPClient: @unchecked Sendable {
         do {
             _ = try await runCommand("LOGIN \(imapQuote(email)) \(imapQuote(password))", timeout: 20)
         } catch {
-            if case IMAPError.commandFailed(let msg) = error {
-                throw IMAPError.loginFailed(msg)
-            }
+            if case IMAPError.commandFailed(let msg) = error { throw IMAPError.loginFailed(msg) }
             throw error
         }
     }
@@ -239,28 +231,24 @@ final class IMAPClient: @unchecked Sendable {
     }
 
     private func searchInvoiceRelated(limit: Int) async throws -> [Int] {
-        // 主题含 发票 / 高德 / 滴滴
-        let keywords = ["发票", "高德", "滴滴", "行程"]
+        let keywords = ["发票", "高德", "滴滴", "行程", "电子发票", "开票"]
         var all: Set<Int> = []
         for kw in keywords {
-            // CHARSET UTF-8 部分服务器支持
             if let resp = try? await runCommand("UID SEARCH SUBJECT \(imapQuote(kw))", timeout: 20) {
                 parseSearchUIDs(resp).forEach { all.insert($0) }
             }
         }
-        let sorted = all.sorted()
-        return Array(sorted.suffix(limit).reversed())
+        return Array(all.sorted().suffix(limit).reversed())
     }
 
     private func searchRecent(limit: Int) async throws -> [Int] {
         let cal = Calendar.current
-        let since = cal.date(byAdding: .day, value: -60, to: Date()) ?? Date()
+        let since = cal.date(byAdding: .day, value: -90, to: Date()) ?? Date()
         let df = DateFormatter()
         df.locale = Locale(identifier: "en_US_POSIX")
         df.timeZone = TimeZone(secondsFromGMT: 0)
         df.dateFormat = "dd-MMM-yyyy"
         let sinceStr = df.string(from: since)
-
         let resp: String
         do {
             resp = try await runCommand("UID SEARCH SINCE \(sinceStr)", timeout: 30)
@@ -273,11 +261,8 @@ final class IMAPClient: @unchecked Sendable {
 
     private func parseSearchUIDs(_ resp: String) -> [Int] {
         var uids: [Int] = []
-        for line in resp.components(separatedBy: "\r\n") {
-            if line.uppercased().hasPrefix("* SEARCH") {
-                let parts = line.split(separator: " ").dropFirst(2)
-                uids.append(contentsOf: parts.compactMap { Int($0) })
-            }
+        for line in resp.components(separatedBy: "\r\n") where line.uppercased().hasPrefix("* SEARCH") {
+            uids.append(contentsOf: line.split(separator: " ").dropFirst(2).compactMap { Int($0) })
         }
         return uids
     }
@@ -293,20 +278,134 @@ final class IMAPClient: @unchecked Sendable {
 
         let full: String
         do {
-            full = try await runCommand("UID FETCH \(uid) BODY.PEEK[]", timeout: 50)
+            full = try await runCommand("UID FETCH \(uid) BODY.PEEK[]", timeout: 60)
         } catch {
             return []
         }
 
         guard let literal = extractLargestLiteral(from: full) else { return [] }
-        return parseAttachments(from: literal, subject: subject, date: date)
+        return expandToInvoiceAttachments(from: literal, subject: subject, date: date)
+    }
+
+    /// 解析 MIME，过滤行程单，解开 ZIP
+    private func expandToInvoiceAttachments(from data: Data, subject: String, date: Date?) -> [EmailAttachment] {
+        var rawParts = collectRawParts(from: data, subject: subject, date: date)
+
+        // 若只有行程单没有发票，仍不导入行程单
+        var invoices: [EmailAttachment] = []
+
+        for part in rawParts {
+            // ZIP 压缩包
+            if isZip(part.data) || part.fileName.lowercased().hasSuffix(".zip") {
+                let extracted = ZipExtractor.extractInvoicePDFs(from: part.data)
+                for item in extracted {
+                    invoices.append(EmailAttachment(
+                        fileName: (item.name as NSString).lastPathComponent,
+                        data: item.data,
+                        subject: subject,
+                        date: date
+                    ))
+                }
+                continue
+            }
+
+            if InvoiceFileFilter.isItinerary(part.fileName) { continue }
+
+            if isPDF(part.data) {
+                // 文件名像行程单也跳过
+                if InvoiceFileFilter.isItinerary(part.fileName) { continue }
+                // 优先要带「发票」的；若文件名不含发票但主题是高德电子发票且不是行程单，也收
+                let nameOK = InvoiceFileFilter.isInvoice(part.fileName)
+                    || (!part.fileName.lowercased().contains("行程") && part.data.count > 5_000)
+                if nameOK {
+                    invoices.append(part)
+                }
+            } else if isJPEG(part.data) || isPNG(part.data) {
+                invoices.append(part)
+            }
+        }
+
+        // 同一邮件若同时有「电子发票」和别的 PDF，只留电子发票
+        let preferred = invoices.filter { InvoiceFileFilter.isInvoice($0.fileName) }
+        if !preferred.isEmpty { return preferred }
+
+        return invoices
+    }
+
+    private func collectRawParts(from data: Data, subject: String, date: Date?) -> [EmailAttachment] {
+        if isPDF(data) {
+            return [EmailAttachment(fileName: defaultPDFName(subject), data: data, subject: subject, date: date)]
+        }
+        if isZip(data) {
+            return [EmailAttachment(fileName: "attachments.zip", data: data, subject: subject, date: date)]
+        }
+
+        guard let text = String(data: data, encoding: .isoLatin1),
+              let boundary = findBoundary(in: text) else {
+            if isJPEG(data) || isPNG(data) {
+                return [EmailAttachment(fileName: "image.jpg", data: data, subject: subject, date: date)]
+            }
+            return []
+        }
+
+        var result: [EmailAttachment] = []
+        let parts = text.components(separatedBy: "--\(boundary)")
+
+        for part in parts {
+            if part.count < 80 { continue }
+            let lower = part.lowercased()
+
+            let looksPDF = lower.contains("application/pdf") || lower.contains(".pdf")
+            let looksZip = lower.contains("application/zip") || lower.contains("application/x-zip")
+                || lower.contains(".zip") || lower.contains("application/octet-stream")
+            let looksImg = lower.contains("image/jpeg") || lower.contains("image/png")
+                || lower.contains(".jpg") || lower.contains(".png")
+
+            guard looksPDF || looksZip || looksImg else { continue }
+
+            var fileName = extractFileName(part).map {
+                MIMEDecoder.decodeEncodedWords($0.removingPercentEncoding ?? $0)
+            } ?? ""
+
+            guard let headerEnd = part.range(of: "\r\n\r\n") ?? part.range(of: "\n\n") else { continue }
+            var body = String(part[headerEnd.upperBound...])
+            if let endMark = body.range(of: "\r\n--") {
+                body = String(body[..<endMark.lowerBound])
+            }
+            body = body.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            let payload: Data?
+            if lower.contains("content-transfer-encoding: base64") {
+                let cleaned = body.components(separatedBy: CharacterSet.whitespacesAndNewlines).joined()
+                payload = Data(base64Encoded: cleaned, options: .ignoreUnknownCharacters)
+            } else if lower.contains("quoted-printable") {
+                payload = MIMEDecoder.decodeQuotedPrintableData(body)
+            } else {
+                payload = body.data(using: .isoLatin1)
+            }
+
+            guard let bytes = payload, bytes.count >= 400 else { continue }
+
+            if fileName.isEmpty {
+                if isPDF(bytes) { fileName = defaultPDFName(subject) }
+                else if isZip(bytes) { fileName = "attachments.zip" }
+                else { fileName = "file.bin" }
+            }
+
+            result.append(EmailAttachment(fileName: fileName, data: bytes, subject: subject, date: date))
+        }
+        return result
+    }
+
+    private func defaultPDFName(_ subject: String) -> String {
+        if subject.contains("发票") { return "\(subject).pdf" }
+        return "电子发票.pdf"
     }
 
     private func extractLargestLiteral(from response: String) -> Data? {
         var best: Data?
         var bestSize = 0
         var search = response.startIndex
-
         while search < response.endIndex {
             guard let open = response.range(of: "{", range: search..<response.endIndex),
                   let close = response.range(of: "}", range: open.upperBound..<response.endIndex) else { break }
@@ -335,89 +434,6 @@ final class IMAPClient: @unchecked Sendable {
             search = close.upperBound
         }
         return best
-    }
-
-    private func parseAttachments(from data: Data, subject: String, date: Date?) -> [EmailAttachment] {
-        if isPDF(data) {
-            let name = defaultFileName(subject: subject, ext: "pdf")
-            return [EmailAttachment(fileName: name, data: data, subject: subject, date: date)]
-        }
-
-        guard let text = String(data: data, encoding: .isoLatin1) else { return [] }
-        guard let boundary = findBoundary(in: text) else {
-            if isJPEG(data) || isPNG(data) {
-                return [EmailAttachment(fileName: defaultFileName(subject: subject, ext: "jpg"), data: data, subject: subject, date: date)]
-            }
-            return []
-        }
-
-        var result: [EmailAttachment] = []
-        let parts = text.components(separatedBy: "--\(boundary)")
-
-        for part in parts {
-            if part.count < 80 { continue }
-            let lower = part.lowercased()
-            let looksPDF = lower.contains("application/pdf") || lower.contains(".pdf")
-            let looksImg = lower.contains("image/jpeg") || lower.contains("image/png")
-                || lower.contains(".jpg") || lower.contains(".jpeg") || lower.contains(".png")
-            guard looksPDF || looksImg else { continue }
-
-            var fileName = extractFileName(part)
-            if let fn = fileName {
-                fileName = MIMEDecoder.decodeEncodedWords(fn.removingPercentEncoding ?? fn)
-            }
-
-            guard let headerEnd = part.range(of: "\r\n\r\n") ?? part.range(of: "\n\n") else { continue }
-            var body = String(part[headerEnd.upperBound...])
-            if let endMark = body.range(of: "\r\n--") {
-                body = String(body[..<endMark.lowerBound])
-            }
-            body = body.trimmingCharacters(in: .whitespacesAndNewlines)
-
-            let payload: Data?
-            if lower.contains("content-transfer-encoding: base64") {
-                let cleaned = body.components(separatedBy: CharacterSet.whitespacesAndNewlines).joined()
-                payload = Data(base64Encoded: cleaned, options: .ignoreUnknownCharacters)
-            } else if lower.contains("quoted-printable") {
-                payload = MIMEDecoder.decodeQuotedPrintableData(body)
-            } else {
-                payload = body.data(using: .isoLatin1)
-            }
-
-            guard var bytes = payload, bytes.count >= 500 else { continue }
-
-            // 必须是真 PDF / 图片，过滤掉解码失败的垃圾
-            let okPDF = isPDF(bytes)
-            let okImg = isJPEG(bytes) || isPNG(bytes)
-            guard okPDF || okImg else { continue }
-
-            if okPDF, let range = bytes.range(of: Data([0x25, 0x25, 0x45, 0x4F, 0x46])) {
-                bytes = Data(bytes.prefix(upTo: range.upperBound))
-            }
-
-            let finalName: String
-            if let fileName, !fileName.isEmpty, !fileName.lowercased().hasPrefix("invoice") {
-                finalName = fileName
-            } else {
-                finalName = defaultFileName(subject: subject, ext: okPDF ? "pdf" : "jpg")
-            }
-
-            result.append(EmailAttachment(fileName: finalName, data: bytes, subject: subject, date: date))
-        }
-        return result
-    }
-
-    private func defaultFileName(subject: String, ext: String) -> String {
-        if let v = MIMEDecoder.vendorFromSubject(subject) {
-            return "\(v).\(ext)"
-        }
-        if !subject.isEmpty {
-            let safe = subject
-                .replacingOccurrences(of: "/", with: "-")
-                .prefix(30)
-            return "\(safe).\(ext)"
-        }
-        return "电子发票.\(ext)"
     }
 
     private func findBoundary(in text: String) -> String? {
@@ -453,7 +469,6 @@ final class IMAPClient: @unchecked Sendable {
     }
 
     private func headerField(_ text: String, _ name: String) -> String? {
-        // 支持折行头
         let lines = text.components(separatedBy: "\r\n")
         let key = name.lowercased() + ":"
         var i = 0
@@ -479,11 +494,7 @@ final class IMAPClient: @unchecked Sendable {
     private func parseEmailDate(_ raw: String?) -> Date? {
         guard var raw else { return nil }
         raw = raw.trimmingCharacters(in: .whitespaces)
-        let formats = [
-            "EEE, dd MMM yyyy HH:mm:ss Z",
-            "dd MMM yyyy HH:mm:ss Z",
-            "EEE, dd MMM yyyy HH:mm:ss zzz"
-        ]
+        let formats = ["EEE, dd MMM yyyy HH:mm:ss Z", "dd MMM yyyy HH:mm:ss Z", "EEE, dd MMM yyyy HH:mm:ss zzz"]
         let df = DateFormatter()
         df.locale = Locale(identifier: "en_US_POSIX")
         for f in formats {
@@ -501,12 +512,9 @@ final class IMAPClient: @unchecked Sendable {
     private func isPDF(_ d: Data) -> Bool {
         d.count > 4 && d[0] == 0x25 && d[1] == 0x50 && d[2] == 0x44 && d[3] == 0x46
     }
-    private func isJPEG(_ d: Data) -> Bool {
-        d.count > 2 && d[0] == 0xFF && d[1] == 0xD8
-    }
-    private func isPNG(_ d: Data) -> Bool {
-        d.count > 4 && d[0] == 0x89 && d[1] == 0x50
-    }
+    private func isJPEG(_ d: Data) -> Bool { d.count > 2 && d[0] == 0xFF && d[1] == 0xD8 }
+    private func isPNG(_ d: Data) -> Bool { d.count > 4 && d[0] == 0x89 && d[1] == 0x50 }
+    private func isZip(_ d: Data) -> Bool { d.count > 4 && d[0] == 0x50 && d[1] == 0x4B && (d[2] == 0x03 || d[2] == 0x05 || d[2] == 0x07) }
 }
 
 private final class OnceFlag: @unchecked Sendable {
