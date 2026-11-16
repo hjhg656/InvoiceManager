@@ -14,6 +14,8 @@
 		300000000000000000000024 /* InvoiceDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 300000000000000000000014 /* InvoiceDetailView.swift */; };
 		300000000000000000000025 /* OCRService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 300000000000000000000017 /* OCRService.swift */; };
 		300000000000000000000026 /* ExportService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 300000000000000000000018 /* ExportService.swift */; };
+		300000000000000000000027 /* BatchListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 300000000000000000000019 /* BatchListView.swift */; };
+		300000000000000000000028 /* InboxImporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 30000000000000000000001A /* InboxImporter.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -26,6 +28,8 @@
 		300000000000000000000016 /* InvoiceManager.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = InvoiceManager.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		300000000000000000000017 /* OCRService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OCRService.swift; sourceTree = "<group>"; };
 		300000000000000000000018 /* ExportService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExportService.swift; sourceTree = "<group>"; };
+		300000000000000000000019 /* BatchListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BatchListView.swift; sourceTree = "<group>"; };
+		30000000000000000000001A /* InboxImporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InboxImporter.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -65,6 +69,7 @@
 				300000000000000000000012 /* ContentView.swift */,
 				300000000000000000000013 /* AddInvoiceView.swift */,
 				300000000000000000000014 /* InvoiceDetailView.swift */,
+				300000000000000000000019 /* BatchListView.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -74,6 +79,7 @@
 			children = (
 				300000000000000000000017 /* OCRService.swift */,
 				300000000000000000000018 /* ExportService.swift */,
+				30000000000000000000001A /* InboxImporter.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -160,6 +166,8 @@
 				300000000000000000000024 /* InvoiceDetailView.swift in Sources */,
 				300000000000000000000025 /* OCRService.swift in Sources */,
 				300000000000000000000026 /* ExportService.swift in Sources */,
+				300000000000000000000027 /* BatchListView.swift in Sources */,
+				300000000000000000000028 /* InboxImporter.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -197,7 +205,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 4;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = InvoiceManager/Info.plist;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -206,7 +214,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.2;
+				MARKETING_VERSION = 1.3;
 				PRODUCT_BUNDLE_IDENTIFIER = com.example.InvoiceManager;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_VERSION = 5.0;
@@ -218,7 +226,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 4;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = InvoiceManager/Info.plist;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -227,7 +235,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.2;
+				MARKETING_VERSION = 1.3;
 				PRODUCT_BUNDLE_IDENTIFIER = com.example.InvoiceManager;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
