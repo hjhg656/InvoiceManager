@@ -5,8 +5,7 @@ struct InvoiceDetailView: View {
     @Bindable var invoice: Invoice
     @Environment(\.modelContext) private var modelContext
     @Environment(\.dismiss) private var dismiss
-    @State private var shareItems: [Any] = []
-    @State private var showShare = false
+    @State private var sharePayload: SharePayload?
 
     var body: some View {
         List {
@@ -31,13 +30,13 @@ struct InvoiceDetailView: View {
             }
 
             Section("状态") {
-                Picker("报销状态", selection: $invoice.status) {
+                Picker("报销状态", selection: $invoice.statusRaw) {
                     ForEach(InvoiceStatus.allCases) { s in
-                        Text(s.rawValue).tag(s)
+                        Text(s.rawValue).tag(s.rawValue)
                     }
                 }
                 .pickerStyle(.segmented)
-                .onChange(of: invoice.status) { _, _ in
+                .onChange(of: invoice.statusRaw) { _, _ in
                     try? modelContext.save()
                 }
             }
@@ -78,8 +77,8 @@ struct InvoiceDetailView: View {
         }
         .navigationTitle("详情")
         .navigationBarTitleDisplayMode(.inline)
-        .sheet(isPresented: $showShare) {
-            ShareSheet(items: shareItems)
+        .sheet(item: $sharePayload) { payload in
+            ActivityView(activityItems: payload.urls)
         }
     }
 
@@ -92,11 +91,15 @@ struct InvoiceDetailView: View {
     }
 
     private func exportOne() {
-        guard let data = invoice.imageData else { return }
-        let name = invoice.fileName ?? "发票-\(String(format: "%.2f", invoice.amount)).bin"
+        guard let data = invoice.imageData, !data.isEmpty else { return }
+        let name = invoice.fileName ?? "发票-\(String(format: "%.2f", invoice.amount)).dat"
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
-        try? data.write(to: url)
-        shareItems = [url]
-        showShare = true
+        do {
+            try data.write(to: url, options: .atomic)
+            guard FileManager.default.fileExists(atPath: url.path) else { return }
+            sharePayload = SharePayload(urls: [url], title: name)
+        } catch {
+            print(error)
+        }
     }
 }

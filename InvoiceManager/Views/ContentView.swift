@@ -2,6 +2,12 @@ import SwiftUI
 import SwiftData
 import UniformTypeIdentifiers
 
+struct SharePayload: Identifiable {
+    let id = UUID()
+    let urls: [URL]
+    let title: String
+}
+
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @Query(sort: \Invoice.date, order: .reverse) private var invoices: [Invoice]
@@ -10,8 +16,7 @@ struct ContentView: View {
     @State private var searchText = ""
     @State private var filterStatus: InvoiceStatus?
     @State private var filterKind: InvoiceKind?
-    @State private var shareItems: [Any] = []
-    @State private var showShare = false
+    @State private var sharePayload: SharePayload?
     @State private var showRestore = false
     @State private var toast: String?
 
@@ -50,7 +55,7 @@ struct ContentView: View {
                     ContentUnavailableView {
                         Label("还没有发票", systemImage: "doc.text")
                     } description: {
-                        Text("支持拍照、相册、PDF 导入，OCR 识别金额后可手动修改。")
+                        Text("点右上角 + 添加。支持拍照、相册、PDF，OCR 后可改金额。")
                     } actions: {
                         Button("添加发票") { showAdd = true }
                             .buttonStyle(.borderedProminent)
@@ -77,7 +82,7 @@ struct ContentView: View {
                                     }
                                     .swipeActions(edge: .leading) {
                                         Button {
-                                            inv.status = .submitted
+                                            inv.statusRaw = InvoiceStatus.submitted.rawValue
                                             try? modelContext.save()
                                         } label: {
                                             Label("已上交", systemImage: "checkmark.circle")
@@ -102,21 +107,31 @@ struct ContentView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Menu {
-                        Button { share(ExportService.makeCSV(invoices: filtered)) } label: {
-                            Label("导出 Excel(CSV)", systemImage: "tablecells")
+                        Button {
+                            exportCSV()
+                        } label: {
+                            Label("导出 Excel 表格 (CSV)", systemImage: "tablecells")
                         }
-                        Button { share(ExportService.makeAttachmentsFolder(invoices: filtered)) } label: {
-                            Label("导出附件文件夹", systemImage: "folder")
+                        Button {
+                            exportAttachments()
+                        } label: {
+                            Label("导出附件", systemImage: "doc.on.doc")
                         }
-                        Button { share(ExportService.makeFinancePackage(invoices: filtered)) } label: {
-                            Label("打包给财务(表+附件)", systemImage: "briefcase")
+                        Button {
+                            exportFinancePackage()
+                        } label: {
+                            Label("打包给财务", systemImage: "briefcase")
                         }
                         Divider()
-                        Button { share(ExportService.makeBackup(invoices: invoices)) } label: {
+                        Button {
+                            exportBackup()
+                        } label: {
                             Label("备份全部数据", systemImage: "externaldrive")
                         }
-                        Button { showRestore = true } label: {
-                            Label("从备份恢复", systemImage: "arrow.clockwise.icloud")
+                        Button {
+                            showRestore = true
+                        } label: {
+                            Label("从备份恢复", systemImage: "arrow.clockwise")
                         }
                     } label: {
                         Image(systemName: "square.and.arrow.up")
@@ -131,8 +146,9 @@ struct ContentView: View {
             .sheet(isPresented: $showAdd) {
                 AddInvoiceView()
             }
-            .sheet(isPresented: $showShare) {
-                ShareSheet(items: shareItems)
+            .sheet(item: $sharePayload) { payload in
+                ActivityView(activityItems: payload.urls)
+                    .presentationDetents([.medium, .large])
             }
             .fileImporter(
                 isPresented: $showRestore,
@@ -149,7 +165,6 @@ struct ContentView: View {
                         .padding(.vertical, 10)
                         .background(.ultraThinMaterial, in: Capsule())
                         .padding(.bottom, 24)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
         }
@@ -181,70 +196,86 @@ struct ContentView: View {
         Section {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
-                    filterChip("全部状态", selected: filterStatus == nil) { filterStatus = nil }
+                    chip("全部状态", on: filterStatus == nil) { filterStatus = nil }
                     ForEach(InvoiceStatus.allCases) { s in
-                        filterChip(s.rawValue, selected: filterStatus == s) {
-                            filterStatus = (filterStatus == s) ? nil : s
+                        chip(s.rawValue, on: filterStatus == s) {
+                            filterStatus = filterStatus == s ? nil : s
                         }
                     }
                 }
             }
+            .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 4, trailing: 12))
+
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
-                    filterChip("全部票种", selected: filterKind == nil) { filterKind = nil }
+                    chip("全部票种", on: filterKind == nil) { filterKind = nil }
                     ForEach(InvoiceKind.allCases) { k in
-                        filterChip(k.rawValue, selected: filterKind == k) {
-                            filterKind = (filterKind == k) ? nil : k
+                        chip(k.rawValue, on: filterKind == k) {
+                            filterKind = filterKind == k ? nil : k
                         }
                     }
                 }
             }
+            .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 8, trailing: 12))
         }
     }
 
-    private func filterChip(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+    private func chip(_ title: String, on: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
                 .font(.caption.weight(.medium))
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
-                .background(selected ? Color.accentColor : Color(.tertiarySystemFill), in: Capsule())
-                .foregroundStyle(selected ? .white : .primary)
+                .background(on ? Color.accentColor : Color(.tertiarySystemFill), in: Capsule())
+                .foregroundStyle(on ? .white : .primary)
         }
         .buttonStyle(.plain)
     }
 
-    private func share(_ url: URL?) {
-        guard let url else {
-            showToast("没有可导出的内容（可能缺少附件）")
+    // MARK: - Export
+
+    private func exportCSV() {
+        guard let url = ExportService.makeCSV(invoices: filtered) else {
+            showToast("导出失败")
             return
         }
-        // 分享文件夹时，收集里面的文件更可靠
-        var items: [Any] = []
-        var isDir: ObjCBool = false
-        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
-            if let files = try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil) {
-                // 若有子目录「附件」，也展开
-                for f in files {
-                    var subDir: ObjCBool = false
-                    if FileManager.default.fileExists(atPath: f.path, isDirectory: &subDir), subDir.boolValue {
-                        if let nested = try? FileManager.default.contentsOfDirectory(at: f, includingPropertiesForKeys: nil) {
-                            items.append(contentsOf: nested)
-                        }
-                    } else {
-                        items.append(f)
-                    }
-                }
-            }
-        } else {
-            items = [url]
-        }
-        if items.isEmpty {
-            showToast("导出内容为空")
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            showToast("文件未生成")
             return
         }
-        shareItems = items
-        showShare = true
+        sharePayload = SharePayload(urls: [url], title: "CSV")
+    }
+
+    private func exportAttachments() {
+        let urls = ExportService.attachmentFileURLs(invoices: filtered)
+        if urls.isEmpty {
+            showToast("当前没有可导出的附件（先导入 PDF/图片）")
+            return
+        }
+        sharePayload = SharePayload(urls: urls, title: "附件")
+    }
+
+    private func exportFinancePackage() {
+        var urls: [URL] = []
+        if let csv = ExportService.makeCSV(invoices: filtered),
+           FileManager.default.fileExists(atPath: csv.path) {
+            urls.append(csv)
+        }
+        urls.append(contentsOf: ExportService.attachmentFileURLs(invoices: filtered))
+        if urls.isEmpty {
+            showToast("没有可导出的内容")
+            return
+        }
+        sharePayload = SharePayload(urls: urls, title: "财务包")
+    }
+
+    private func exportBackup() {
+        guard let url = ExportService.makeBackup(invoices: invoices),
+              FileManager.default.fileExists(atPath: url.path) else {
+            showToast("备份失败")
+            return
+        }
+        sharePayload = SharePayload(urls: [url], title: "备份")
     }
 
     private func restore(_ result: Result<[URL], Error>) {
@@ -253,17 +284,15 @@ struct ContentView: View {
         defer { if access { url.stopAccessingSecurityScopedResource() } }
         do {
             let n = try ExportService.restoreBackup(from: url, into: modelContext)
-            showToast("已恢复 \(n) 条发票")
+            showToast("已恢复 \(n) 条")
         } catch {
             showToast("恢复失败：\(error.localizedDescription)")
         }
     }
 
     private func showToast(_ text: String) {
-        withAnimation { toast = text }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) {
-            withAnimation { toast = nil }
-        }
+        toast = text
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { toast = nil }
     }
 }
 
@@ -327,10 +356,16 @@ struct InvoiceRow: View {
     }
 }
 
-struct ShareSheet: UIViewControllerRepresentable {
-    let items: [Any]
+/// 系统分享面板（只接受真实存在的文件 URL）
+struct ActivityView: UIViewControllerRepresentable {
+    let activityItems: [URL]
+
     func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: items, applicationActivities: nil)
+        let existing = activityItems.filter { FileManager.default.fileExists(atPath: $0.path) }
+        let vc = UIActivityViewController(activityItems: existing, applicationActivities: nil)
+        vc.completionWithItemsHandler = { _, _, _, _ in }
+        return vc
     }
+
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }

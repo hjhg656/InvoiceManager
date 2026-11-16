@@ -3,9 +3,11 @@ import SwiftData
 
 enum ExportService {
 
+    /// Excel 可打开的 CSV（UTF-8 BOM）
     static func makeCSV(invoices: [Invoice]) -> URL? {
         var lines: [String] = ["\u{FEFF}日期,商家,票种,状态,金额,备注,来源,文件名"]
         let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
         df.dateFormat = "yyyy-MM-dd"
 
         for inv in invoices.sorted(by: { $0.date > $1.date }) {
@@ -26,60 +28,40 @@ enum ExportService {
             .appendingPathComponent("发票台账-\(stamp()).csv")
         do {
             try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+            // 确认写成功
+            guard FileManager.default.fileExists(atPath: url.path),
+                  (try? Data(contentsOf: url))?.isEmpty == false else { return nil }
             return url
         } catch {
+            print("CSV error: \(error)")
             return nil
         }
     }
 
-    static func makeAttachmentsFolder(invoices: [Invoice]) -> URL? {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("发票附件-\(stamp())", isDirectory: true)
-        try? FileManager.default.removeItem(at: root)
-        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    /// 把每张有附件的发票写成独立文件，返回可分享的 URL 列表
+    static func attachmentFileURLs(invoices: [Invoice]) -> [URL] {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("inv-att-\(stamp())", isDirectory: true)
+        try? FileManager.default.removeItem(at: dir)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
-        var count = 0
+        var result: [URL] = []
+        var index = 1
         for inv in invoices {
             guard let data = inv.imageData, !data.isEmpty else { continue }
-            let fname = safeFileName(for: inv, data: data)
+            let name = uniqueName(for: inv, data: data, index: index)
+            let fileURL = dir.appendingPathComponent(name)
             do {
-                try data.write(to: root.appendingPathComponent(fname))
-                count += 1
-            } catch { continue }
+                try data.write(to: fileURL, options: .atomic)
+                if FileManager.default.fileExists(atPath: fileURL.path) {
+                    result.append(fileURL)
+                    index += 1
+                }
+            } catch {
+                print("write att error: \(error)")
+            }
         }
-        return count > 0 ? root : nil
-    }
-
-    static func makeFinancePackage(invoices: [Invoice]) -> URL? {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("报销材料-\(stamp())", isDirectory: true)
-        try? FileManager.default.removeItem(at: root)
-        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-
-        if let csv = makeCSV(invoices: invoices) {
-            try? FileManager.default.copyItem(at: csv, to: root.appendingPathComponent(csv.lastPathComponent))
-        }
-
-        let attDir = root.appendingPathComponent("附件", isDirectory: true)
-        try? FileManager.default.createDirectory(at: attDir, withIntermediateDirectories: true)
-        var count = 0
-        for inv in invoices {
-            guard let data = inv.imageData, !data.isEmpty else { continue }
-            try? data.write(to: attDir.appendingPathComponent(safeFileName(for: inv, data: data)))
-            count += 1
-        }
-
-        let total = invoices.reduce(0.0) { $0 + $1.amount }
-        let readme = """
-        报销材料说明
-        ------------
-        1. CSV 用 Excel / Numbers 打开
-        2. 「附件」文件夹是发票原件
-        3. 共 \(invoices.count) 条，附件 \(count) 个
-        合计：¥\(String(format: "%.2f", total))
-        """
-        try? readme.write(to: root.appendingPathComponent("说明.txt"), atomically: true, encoding: .utf8)
-        return root
+        return result
     }
 
     static func makeBackup(invoices: [Invoice]) -> URL? {
@@ -112,8 +94,12 @@ enum ExportService {
         guard let data = try? enc.encode(items) else { return nil }
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("发票备份-\(stamp()).json")
-        try? data.write(to: url)
-        return url
+        do {
+            try data.write(to: url, options: .atomic)
+            return FileManager.default.fileExists(atPath: url.path) ? url : nil
+        } catch {
+            return nil
+        }
     }
 
     static func restoreBackup(from url: URL, into context: ModelContext) throws -> Int {
@@ -150,6 +136,8 @@ enum ExportService {
         return items.count
     }
 
+    // MARK: - helpers
+
     private static func esc(_ s: String) -> String {
         if s.contains(",") || s.contains("\"") || s.contains("\n") {
             return "\"" + s.replacingOccurrences(of: "\"", with: "\"\"") + "\""
@@ -159,17 +147,22 @@ enum ExportService {
 
     private static func stamp() -> String {
         let f = DateFormatter()
-        f.dateFormat = "yyyyMMdd-HHmm"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyyMMdd-HHmmss"
         return f.string(from: Date())
     }
 
-    private static func safeFileName(for inv: Invoice, data: Data) -> String {
+    private static func uniqueName(for inv: Invoice, data: Data, index: Int) -> String {
+        let ext = isPDF(data) ? "pdf" : "jpg"
         if let fn = inv.fileName, !fn.isEmpty {
-            return fn.replacingOccurrences(of: "/", with: "-")
+            return "\(index)-\(fn.replacingOccurrences(of: "/", with: "-"))"
         }
         let vendor = inv.vendor.isEmpty ? "发票" : inv.vendor
         let amount = String(format: "%.2f", inv.amount)
-        let ext = (data.count > 4 && data[0] == 0x25 && data[1] == 0x50) ? "pdf" : "jpg"
-        return "\(vendor)-\(amount).\(ext)".replacingOccurrences(of: "/", with: "-")
+        return "\(index)-\(vendor)-\(amount).\(ext)".replacingOccurrences(of: "/", with: "-")
+    }
+
+    private static func isPDF(_ data: Data) -> Bool {
+        data.count > 4 && data[0] == 0x25 && data[1] == 0x50
     }
 }
